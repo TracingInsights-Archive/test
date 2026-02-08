@@ -312,8 +312,8 @@ class TelemetryExtractorOptimized:
     ) -> int:
         """Process laps and write individual telemetry files.
 
-        Pulls all telemetry once per driver and splits by LapNumber via
-        groupby (fast path) or time-window masking (fallback).
+        Fetches telemetry per-lap to ensure every lap is captured,
+        matching the original race.py behavior.
         """
         if not lap_numbers:
             return 0
@@ -341,49 +341,20 @@ class TelemetryExtractorOptimized:
                 laps = f1session.laps
                 driver_laps = laps.pick_drivers(driver).copy()
 
-            all_telemetry = driver_laps.get_telemetry()
-            if all_telemetry.empty:
-                return processed_count
-
-            pending_laps_set = set(pending_laps)
-            has_lap_number = "LapNumber" in all_telemetry.columns
-
-            if has_lap_number:
-                telemetry_by_lap = {
-                    int(lap_num): group
-                    for lap_num, group in all_telemetry.groupby("LapNumber", sort=False)
-                    if int(lap_num) in pending_laps_set
-                }
-            else:
-                telemetry_by_lap = {}
-                tel_time = all_telemetry["Time"].values
-                for _, lap_row in driver_laps.iterrows():
-                    lap_num = int(lap_row["LapNumber"])
-                    if lap_num not in pending_laps_set:
-                        continue
-                    try:
-                        lap_start = lap_row["LapStartTime"]
-                        lap_end = lap_start + lap_row["LapTime"]
-                        if pd.isna(lap_start) or pd.isna(lap_end):
-                            continue
-                        start_ns = lap_start.value
-                        end_ns = lap_end.value
-                        mask = (tel_time >= start_ns) & (tel_time <= end_ns)
-                        lap_tel = all_telemetry[mask]
-                        if not lap_tel.empty:
-                            telemetry_by_lap[lap_num] = lap_tel
-                    except Exception:
-                        pass
-
             for lap_num in pending_laps:
                 try:
-                    lap_tel = telemetry_by_lap.get(lap_num)
-                    if lap_tel is None or lap_tel.empty:
+                    selected_lap = driver_laps[driver_laps["LapNumber"] == lap_num]
+                    if selected_lap.empty:
+                        logger.warning(f"No data for {driver} lap {lap_num} in {event} {session}")
+                        continue
+
+                    telemetry = selected_lap.get_telemetry()
+                    if telemetry.empty or len(telemetry) < 2:
                         continue
 
                     data_key = f"{self.year}-{event}-{session}-{driver}-{lap_num}"
                     telemetry_data = self.process_single_lap_telemetry(
-                        lap_tel, data_key
+                        telemetry, data_key
                     )
                     if telemetry_data is None:
                         continue
