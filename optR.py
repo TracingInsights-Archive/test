@@ -301,86 +301,56 @@ class TelemetryExtractorOptimized:
             }
         }
 
-    def process_lap_batch(
+    def process_lap(
         self,
         event: str,
         session: str,
         driver: str,
-        lap_numbers: List[int],
+        lap_number: int,
         driver_dir: str,
         f1session=None,
         driver_laps=None,
-    ) -> int:
-        """Process a batch of laps for a driver using grouped telemetry."""
-        processed_count = 0
+    ) -> bool:
+        """Process a single lap for a driver."""
+        file_path = f"{driver_dir}/{lap_number}_tel.json"
+
+        if os.path.exists(file_path):
+            return True
 
         try:
             if f1session is None:
                 f1session = self.get_session(event, session, load_telemetry=True)
 
-            laps = f1session.laps
             if driver_laps is None:
+                laps = f1session.laps
                 driver_laps = laps.pick_drivers(driver).copy()
 
-            all_telemetry = driver_laps.get_telemetry()
-            if all_telemetry.empty:
-                return 0
+            selected_lap = driver_laps[driver_laps.LapNumber == lap_number]
 
-            has_lap_number = "LapNumber" in all_telemetry.columns
+            if selected_lap.empty:
+                logger.warning(
+                    f"No data for {driver} lap {lap_number} in {event} {session}"
+                )
+                return False
 
-            if has_lap_number:
-                telemetry_by_lap = {
-                    int(lap_num): group
-                    for lap_num, group in all_telemetry.groupby("LapNumber", sort=False)
-                }
-            else:
-                telemetry_by_lap = {}
-                tel_time = all_telemetry["Time"].values
-                lap_numbers_set = set(lap_numbers)
-                for _, lap_row in driver_laps.iterrows():
-                    lap_num = int(lap_row["LapNumber"])
-                    if lap_num not in lap_numbers_set:
-                        continue
-                    try:
-                        lap_start = lap_row["LapStartTime"]
-                        lap_end = lap_start + lap_row["LapTime"]
-                        if pd.isna(lap_start) or pd.isna(lap_end):
-                            continue
-                        start_ns = lap_start.value
-                        end_ns = lap_end.value
-                        mask = (tel_time >= start_ns) & (tel_time <= end_ns)
-                        lap_tel = all_telemetry[mask]
-                        if not lap_tel.empty:
-                            telemetry_by_lap[lap_num] = lap_tel
-                    except Exception:
-                        pass
+            telemetry = selected_lap.get_telemetry()
 
-            for lap_num in lap_numbers:
-                file_path = f"{driver_dir}/{lap_num}_tel.json"
+            if telemetry.empty:
+                logger.warning(
+                    f"No telemetry for {driver} lap {lap_number} in {event} {session}"
+                )
+                return False
 
-                if os.path.exists(file_path):
-                    processed_count += 1
-                    continue
+            data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
+            telemetry_data = self.process_single_lap_telemetry(telemetry, data_key)
 
-                try:
-                    lap_tel = telemetry_by_lap.get(lap_num)
-                    if lap_tel is None or lap_tel.empty:
-                        continue
+            with open(file_path, "wb") as json_file:
+                json_file.write(orjson.dumps(telemetry_data))
 
-                    data_key = f"{self.year}-{event}-{session}-{driver}-{lap_num}"
-                    telemetry_data = self.process_single_lap_telemetry(lap_tel, data_key)
-
-                    with open(file_path, "wb") as json_file:
-                        json_file.write(orjson.dumps(telemetry_data))
-
-                    processed_count += 1
-                except Exception as e:
-                    logger.error(f"Error processing lap {lap_num}: {str(e)}")
-
+            return True
         except Exception as e:
-            logger.error(f"Error in batch processing for {driver}: {str(e)}")
-
-        return processed_count
+            logger.error(f"Error processing lap {lap_number} for {driver}: {str(e)}")
+            return False
 
     def process_driver(
         self, event: str, session: str, driver: str, base_dir: str, f1session=None
@@ -407,9 +377,23 @@ class TelemetryExtractorOptimized:
             driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
             lap_numbers = driver_laps["LapNumber"].tolist()
 
-            self.process_lap_batch(
-                event, session, driver, lap_numbers, driver_dir, f1session, driver_laps
-            )
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [
+                    executor.submit(
+                        self.process_lap,
+                        event,
+                        session,
+                        driver,
+                        lap_number,
+                        driver_dir,
+                        f1session,
+                        driver_laps,
+                    )
+                    for lap_number in lap_numbers
+                ]
+
+                for future in as_completed(futures):
+                    future.result()
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {str(e)}")
