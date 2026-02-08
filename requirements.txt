@@ -4,3 +4,5 @@ psutil
 urllib3
 pyarrow
 joblib
+numba
+ratelimit
