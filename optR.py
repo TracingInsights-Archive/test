@@ -263,10 +263,36 @@ class TelemetryExtractorOptimized:
         telemetry["Az"] = az
         return telemetry
 
+    def _empty_telemetry_payload(self, data_key: str) -> Dict:
+        """Return a placeholder payload when telemetry is missing."""
+        return {
+            "tel": {
+                "time": [],
+                "rpm": [],
+                "speed": [],
+                "gear": [],
+                "throttle": [],
+                "brake": [],
+                "drs": [],
+                "distance": [],
+                "rel_distance": [],
+                "acc_x": [],
+                "acc_y": [],
+                "acc_z": [],
+                "x": [],
+                "y": [],
+                "z": [],
+                "dataKey": data_key,
+            }
+        }
+
     def process_single_lap_telemetry(
         self, telemetry: pd.DataFrame, data_key: str
-    ) -> Dict:
+    ) -> Optional[Dict]:
         """Process telemetry for a single lap."""
+        if telemetry.empty or len(telemetry) < 2:
+            return self._empty_telemetry_payload(data_key)
+
         if self.use_numba:
             acc_tel = self.accCalc_numba(telemetry)
         else:
@@ -317,40 +343,63 @@ class TelemetryExtractorOptimized:
         if os.path.exists(file_path):
             return True
 
-        try:
-            if f1session is None:
-                f1session = self.get_session(event, session, load_telemetry=True)
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                if f1session is None:
+                    f1session = self.get_session(event, session, load_telemetry=True)
 
-            if driver_laps is None:
-                laps = f1session.laps
-                driver_laps = laps.pick_drivers(driver).copy()
+                if driver_laps is None:
+                    laps = f1session.laps
+                    driver_laps = laps.pick_drivers(driver).copy()
 
-            selected_lap = driver_laps[driver_laps.LapNumber == lap_number]
+                selected_lap = driver_laps[driver_laps.LapNumber == lap_number]
 
-            if selected_lap.empty:
-                logger.warning(
-                    f"No data for {driver} lap {lap_number} in {event} {session}"
-                )
-                return False
+                data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
 
-            telemetry = selected_lap.get_telemetry()
+                if selected_lap.empty:
+                    logger.warning(
+                        f"No data for {driver} lap {lap_number} in {event} {session}"
+                    )
+                    telemetry_data = self._empty_telemetry_payload(data_key)
+                else:
+                    try:
+                        telemetry = selected_lap.get_telemetry()
+                    except Exception as exc:
+                        logger.warning(
+                            "Telemetry unavailable for %s lap %s in %s %s: %s",
+                            driver,
+                            lap_number,
+                            event,
+                            session,
+                            exc,
+                        )
+                        telemetry_data = self._empty_telemetry_payload(data_key)
+                    else:
+                        telemetry_data = self.process_single_lap_telemetry(
+                            telemetry, data_key
+                        )
 
-            if telemetry.empty:
-                logger.warning(
-                    f"No telemetry for {driver} lap {lap_number} in {event} {session}"
-                )
-                return False
+                if telemetry_data is None:
+                    logger.warning(
+                        f"Insufficient telemetry for {driver} lap {lap_number} in {event} {session}"
+                    )
+                    telemetry_data = self._empty_telemetry_payload(data_key)
 
-            data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
-            telemetry_data = self.process_single_lap_telemetry(telemetry, data_key)
+                with open(file_path, "wb") as json_file:
+                    json_file.write(orjson.dumps(telemetry_data))
 
-            with open(file_path, "wb") as json_file:
-                json_file.write(orjson.dumps(telemetry_data))
-
-            return True
-        except Exception as e:
-            logger.error(f"Error processing lap {lap_number} for {driver}: {str(e)}")
-            return False
+                return True
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Retry {attempt + 1}/{max_retries} for lap {lap_number} of {driver}: {str(e)}"
+                    )
+                    time.sleep(0.1)
+                else:
+                    logger.error(f"Error processing lap {lap_number} for {driver}: {str(e)}")
+                    return False
+        return False
 
     def process_driver(
         self, event: str, session: str, driver: str, base_dir: str, f1session=None
@@ -366,19 +415,19 @@ class TelemetryExtractorOptimized:
             laps = f1session.laps
             driver_laps = laps.pick_drivers(driver).copy()
 
-            if driver_laps.empty:
-                logger.warning(f"No laps for driver {driver}")
-                return
-
             laptimes = self.laps_data(driver_laps)
             with open(f"{driver_dir}/laptimes.json", "wb") as json_file:
                 json_file.write(orjson.dumps(laptimes))
+
+            if driver_laps.empty:
+                logger.warning(f"No laps for driver {driver}")
+                return
 
             driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
             lap_numbers = driver_laps["LapNumber"].tolist()
 
             with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [
+                futures = {
                     executor.submit(
                         self.process_lap,
                         event,
@@ -388,12 +437,18 @@ class TelemetryExtractorOptimized:
                         driver_dir,
                         f1session,
                         driver_laps,
-                    )
+                    ): lap_number
                     for lap_number in lap_numbers
-                ]
+                }
 
                 for future in as_completed(futures):
-                    future.result()
+                    lap_num = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing lap {lap_num} for {driver}: {str(e)}"
+                        )
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {str(e)}")
@@ -530,24 +585,19 @@ class TelemetryExtractorOptimized:
                 with open(f"{base_dir}/corners.json", "wb") as json_file:
                     json_file.write(orjson.dumps(corner_info))
 
-            max_workers = min(2, len(drivers))
-            if max_workers > 1:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(
-                            self.process_driver, event, session, driver, base_dir, f1session
-                        ): driver
-                        for driver in drivers
-                    }
-                    for future in as_completed(futures):
-                        driver = futures[future]
-                        try:
-                            future.result()
-                        except Exception as e:
-                            logger.error(f"Error processing driver {driver}: {str(e)}")
-            else:
-                for driver in drivers:
-                    self.process_driver(event, session, driver, base_dir, f1session)
+            with ThreadPoolExecutor(max_workers=min(8, len(drivers))) as executor:
+                futures = {
+                    executor.submit(
+                        self.process_driver, event, session, driver, base_dir, f1session
+                    ): driver
+                    for driver in drivers
+                }
+                for future in as_completed(futures):
+                    driver = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Error processing driver {driver}: {str(e)}")
 
             cache_key = f"{self.year}-{event}-{session}"
             SESSION_CACHE.pop(cache_key, None)
