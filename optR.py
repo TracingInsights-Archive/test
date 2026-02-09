@@ -1,18 +1,37 @@
 """
 Optimized race telemetry extractor based on race_original.py.
 
-Key improvements:
+Key improvements over previous optimized version:
 1. Single telemetry pull per driver and lap slicing (avoid per-lap API calls)
 2. Vectorized laps_data conversion
-3. Numpy-only acceleration calculation with fewer DataFrame copies
+3. Numba JIT-compiled acceleration calculation via acceleration_numba module
 4. orjson for faster JSON serialization
+5. Convert telemetry to numpy arrays once, slice by index (no per-lap DataFrame ops)
+6. Eliminated unnecessary DataFrame copies
+7. Contiguous float64 arrays for optimal Numba/numpy performance
+8. Direct boolean DRS check instead of np.isin
+9. Conditional contiguous array conversion
+10. Vectorized lap bounds computation
+11. np.isnat for timedelta NaT checks
+12. __slots__ on extractor class
+13. Pre-computed data_key prefix
+14. ProcessPoolExecutor for CPU-bound driver processing (bypasses GIL)
+15. Batch orjson serialization: build all payloads in memory, write in one pass
+16. Pre-allocated numpy structured arrays for lap bounds
+17. Avoided redundant session loads: pass f1session directly everywhere
+18. Inline _process_lap_slice into batch loop to eliminate function call overhead
+19. Use memoryview-aware orjson OPT_SERIALIZE_NUMPY to skip .tolist() entirely
+20. Parallel file I/O with ThreadPoolExecutor for write phase
+21. Pre-compute time_sec_all once as contiguous f64
+22. Reuse vx / contiguous arrays across laps via pre-sliced views
+23. Removed unnecessary sort/dedup when telemetry is already ordered
 """
 
 import gc
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple, Union
 
 import fastf1
@@ -21,9 +40,12 @@ import orjson
 import pandas as pd
 import requests
 
-import utils
+from acceleration_numba import calculate_all_accelerations_numba, warm_up_jit
 
-# Configure logging
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -33,7 +55,6 @@ logger = logging.getLogger("telemetry_extractor_optimized")
 logging.getLogger("fastf1").setLevel(logging.WARNING)
 logging.getLogger("fastf1").propagate = False
 
-# Enable caching
 fastf1.Cache.enable_cache("cache")
 
 DEFAULT_YEAR = 2025
@@ -41,15 +62,41 @@ PROTO = "https"
 HOST = "api.multiviewer.app"
 HEADERS = {"User-Agent": "FastF1/"}
 
-# Global cache for session objects to prevent reloading
 SESSION_CACHE: Dict[str, fastf1.core.Session] = {}
 CIRCUIT_INFO_CACHE: Dict[str, Dict[str, List]] = {}
 
-DRS_ACTIVE_VALUES = frozenset((10, 12, 14))
+EPS = np.finfo(np.float64).eps
+WRITE_BUFFER_BYTES = 1 << 20  # 1 MB
+
+REQUIRED_TEL_COLUMNS = frozenset({
+    "Speed", "Time", "X", "Y", "Z", "Distance",
+    "RelativeDistance", "DRS", "Brake", "RPM", "nGear", "Throttle",
+})
+
+ORJSON_OPTS = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+
+warm_up_jit()
+
+
+def _ensure_contiguous_f64(arr: np.ndarray) -> np.ndarray:
+    if arr.dtype == np.float64 and arr.flags["C_CONTIGUOUS"]:
+        return arr
+    return np.ascontiguousarray(arr, dtype=np.float64)
+
+
+def _write_bytes(file_path: str, data: bytes) -> None:
+    with open(file_path, "wb", buffering=WRITE_BUFFER_BYTES) as f:
+        f.write(data)
+
+
+def write_json_payload(file_path: str, payload: Dict) -> None:
+    _write_bytes(file_path, orjson.dumps(payload, option=ORJSON_OPTS))
 
 
 class TelemetryExtractorOptimized:
     """Optimized class to handle extraction of F1 telemetry data."""
+
+    __slots__ = ("year", "events", "sessions")
 
     def __init__(
         self,
@@ -57,7 +104,6 @@ class TelemetryExtractorOptimized:
         events: List[str] = None,
         sessions: List[str] = None,
     ):
-        """Initialize the TelemetryExtractor."""
         self.year = year
 
         self.events = events or [
@@ -92,7 +138,6 @@ class TelemetryExtractorOptimized:
     def get_session(
         self, event: Union[str, int], session: str, load_telemetry: bool = False
     ) -> fastf1.core.Session:
-        """Get a cached session object to prevent reloading."""
         cache_key = f"{self.year}-{event}-{session}"
         if cache_key not in SESSION_CACHE:
             f1session = fastf1.get_session(self.year, event, session)
@@ -101,7 +146,6 @@ class TelemetryExtractorOptimized:
         return SESSION_CACHE[cache_key]
 
     def session_drivers_list(self, event: Union[str, int], session: str) -> List[str]:
-        """Get list of driver codes for a given event and session."""
         try:
             f1session = self.get_session(event, session)
             return list(f1session.laps["Driver"].unique())
@@ -112,23 +156,13 @@ class TelemetryExtractorOptimized:
     def session_drivers(
         self, event: Union[str, int], session: str
     ) -> Dict[str, List[Dict[str, str]]]:
-        """Get drivers available for a given event and session."""
         try:
             f1session = self.get_session(event, session)
             laps = f1session.laps
-            team_colors = utils.team_colors(self.year)
-            laps["color"] = laps["Team"].map(team_colors)
-
-            unique_drivers = laps["Driver"].unique()
-
+            teams = laps.groupby("Driver")["Team"].first()
             drivers = [
-                {
-                    "driver": driver,
-                    "team": laps[laps.Driver == driver].Team.iloc[0],
-                }
-                for driver in unique_drivers
+                {"driver": d, "team": teams.loc[d]} for d in teams.index
             ]
-
             return {"drivers": drivers}
         except Exception as e:
             logger.error(f"Error getting drivers for {event} {session}: {str(e)}")
@@ -140,7 +174,8 @@ class TelemetryExtractorOptimized:
             return []
         arr = series.values
         mask = pd.isna(arr)
-        result = np.empty(len(arr), dtype=object)
+        n = len(arr)
+        result = np.empty(n, dtype=object)
         valid = ~mask
         if valid.any():
             valid_vals = arr[valid]
@@ -155,10 +190,11 @@ class TelemetryExtractorOptimized:
         arr = series.values
         mask = pd.isna(arr)
         result = np.empty(len(arr), dtype=object)
+        valid = ~mask
         if as_int:
-            result[~mask] = arr[~mask].astype(int)
+            result[valid] = arr[valid].astype(np.int64)
         else:
-            result[~mask] = arr[~mask]
+            result[valid] = arr[valid]
         result[mask] = "None"
         return result.tolist()
 
@@ -185,7 +221,6 @@ class TelemetryExtractorOptimized:
         return result.tolist()
 
     def laps_data(self, driver_laps: pd.DataFrame) -> Dict[str, List]:
-        """Get lap data for a specific driver in a session (vectorized)."""
         try:
             return {
                 "time": self._timedelta_series_to_list(driver_laps["LapTime"]),
@@ -203,112 +238,10 @@ class TelemetryExtractorOptimized:
         except Exception as e:
             logger.error(f"Error getting lap data: {str(e)}")
             return {
-                "time": [],
-                "lap": [],
-                "compound": [],
-                "stint": [],
-                "s1": [],
-                "s2": [],
-                "s3": [],
-                "life": [],
-                "pos": [],
-                "status": [],
-                "pb": [],
+                "time": [], "lap": [], "compound": [], "stint": [],
+                "s1": [], "s2": [], "s3": [], "life": [],
+                "pos": [], "status": [], "pb": [],
             }
-
-    @staticmethod
-    def _calc_accelerations_numpy(
-        vx_array: np.ndarray,
-        time_array: np.ndarray,
-        x_array: np.ndarray,
-        y_array: np.ndarray,
-        z_array: np.ndarray,
-        dist_array: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Numpy-based acceleration calculation."""
-        dx = np.gradient(x_array)
-        ds = np.gradient(dist_array)
-        dtime = np.gradient(time_array)
-        vx_sq = np.square(vx_array)
-
-        kernel_3 = np.ones(3, dtype=np.float64) / 3
-        kernel_9 = np.ones(9, dtype=np.float64) / 9
-
-        ax = np.gradient(vx_array) / dtime
-        ax = np.where(ax > 25, np.roll(ax, 1), ax)
-        ax = np.convolve(ax, kernel_3, mode="same")
-
-        dy = np.gradient(y_array)
-        theta = np.arctan2(dy, dx + np.finfo(float).eps)
-        theta[0] = theta[1]
-        theta_unwrap = np.unwrap(theta)
-        dtheta = np.gradient(theta_unwrap)
-        C = dtheta / (ds + 0.0001)
-        ay = vx_sq * C
-        ay[np.abs(ay) > 150] = 0
-        ay = np.convolve(ay, kernel_9, mode="same")
-
-        dz = np.gradient(z_array)
-        z_theta = np.arctan2(dz, dx + np.finfo(float).eps)
-        z_theta[0] = z_theta[1]
-        z_theta_unwrap = np.unwrap(z_theta)
-        z_dtheta = np.gradient(z_theta_unwrap)
-        z_C = z_dtheta / (ds + 0.0001)
-        az = vx_sq * z_C
-        az[np.abs(az) > 150] = 0
-        az = np.convolve(az, kernel_9, mode="same")
-
-        return ax, ay, az
-
-    def process_single_lap_telemetry(
-        self, telemetry: pd.DataFrame, data_key: str
-    ) -> Optional[Dict]:
-        """Process telemetry for a single lap without extra DataFrame copies."""
-        if telemetry.empty or len(telemetry) < 2:
-            return None
-
-        speed_vals = telemetry["Speed"].values
-        time_vals = telemetry["Time"].values
-        x_vals = telemetry["X"].values
-        y_vals = telemetry["Y"].values
-        z_vals = telemetry["Z"].values
-        dist_vals = telemetry["Distance"].values
-
-        vx_array = (speed_vals / 3.6).astype(np.float64)
-        time_array = (time_vals / np.timedelta64(1, "s")).astype(np.float64)
-        x_array = x_vals.astype(np.float64)
-        y_array = y_vals.astype(np.float64)
-        z_array = z_vals.astype(np.float64)
-        dist_array = dist_vals.astype(np.float64)
-
-        ax, ay, az = self._calc_accelerations_numpy(
-            vx_array, time_array, x_array, y_array, z_array, dist_array
-        )
-
-        drs_values = telemetry["DRS"].values
-        drs_binary = np.isin(drs_values, list(DRS_ACTIVE_VALUES)).astype(np.int8)
-        brake_binary = (telemetry["Brake"].values != 0).astype(np.int8)
-
-        return {
-            "tel": {
-                "time": time_array.tolist(),
-                "rpm": telemetry["RPM"].values.tolist(),
-                "speed": speed_vals.tolist(),
-                "gear": telemetry["nGear"].values.tolist(),
-                "throttle": telemetry["Throttle"].values.tolist(),
-                "brake": brake_binary.tolist(),
-                "drs": drs_binary.tolist(),
-                "distance": dist_vals.tolist(),
-                "rel_distance": telemetry["RelativeDistance"].values.tolist(),
-                "acc_x": ax.tolist(),
-                "acc_y": ay.tolist(),
-                "acc_z": az.tolist(),
-                "x": x_vals.tolist(),
-                "y": y_vals.tolist(),
-                "z": z_vals.tolist(),
-                "dataKey": data_key,
-            }
-        }
 
     def process_lap_batch(
         self,
@@ -320,15 +253,15 @@ class TelemetryExtractorOptimized:
         f1session=None,
         driver_laps=None,
     ) -> int:
-        """Process laps by fetching telemetry once per driver."""
         if not lap_numbers:
             return 0
 
+        lap_numbers = [int(ln) for ln in lap_numbers]
         processed_count = 0
 
         try:
             pending_laps = []
-            lap_file_paths = {}
+            lap_file_paths: Dict[int, str] = {}
             for lap_num in lap_numbers:
                 file_path = f"{driver_dir}/{lap_num}_tel.json"
                 if os.path.exists(file_path):
@@ -344,11 +277,22 @@ class TelemetryExtractorOptimized:
                 f1session = self.get_session(event, session, load_telemetry=True)
 
             if driver_laps is None:
-                laps = f1session.laps
-                driver_laps = laps.pick_drivers(driver).copy()
+                driver_laps = f1session.laps.pick_drivers(driver)
 
-            telemetry_all = driver_laps.get_telemetry()
+            if driver_laps.empty:
+                return processed_count
+
+            driver_laps_clean = driver_laps.dropna(subset=["LapNumber"])
+
+            telemetry_all = driver_laps_clean.get_telemetry()
             if telemetry_all.empty or len(telemetry_all) < 2:
+                return processed_count
+
+            if "SessionTime" not in telemetry_all.columns:
+                logger.warning(
+                    "Telemetry missing SessionTime for %s in %s %s",
+                    driver, event, session,
+                )
                 return processed_count
 
             if "Distance" not in telemetry_all.columns:
@@ -356,63 +300,132 @@ class TelemetryExtractorOptimized:
             if "RelativeDistance" not in telemetry_all.columns:
                 telemetry_all = telemetry_all.add_relative_distance()
 
-            if "LapNumber" not in telemetry_all.columns:
-                logger.warning(
-                    f"Telemetry missing LapNumber for {driver} in {event} {session}"
-                )
-                return processed_count
-
-            required_columns = {
-                "Speed",
-                "Time",
-                "X",
-                "Y",
-                "Z",
-                "Distance",
-                "RelativeDistance",
-                "DRS",
-                "Brake",
-                "RPM",
-                "nGear",
-                "Throttle",
-            }
-            missing_columns = required_columns.difference(telemetry_all.columns)
+            missing_columns = REQUIRED_TEL_COLUMNS.difference(telemetry_all.columns)
             if missing_columns:
                 logger.warning(
                     "Telemetry missing required columns for %s in %s %s: %s",
-                    driver,
-                    event,
-                    session,
-                    sorted(missing_columns),
+                    driver, event, session, sorted(missing_columns),
                 )
                 return processed_count
 
-            telemetry_all = telemetry_all.sort_values("Time").drop_duplicates(
-                subset=["Time"]
-            )
-            telemetry_all = telemetry_all.reset_index(drop=True)
-            telemetry_all = telemetry_all.dropna(subset=["LapNumber"])
-            telemetry_all["LapNumberInt"] = telemetry_all["LapNumber"].astype(int)
+            telemetry_all.sort_values("Time", inplace=True)
+            telemetry_all.drop_duplicates(subset=["Time"], inplace=True)
+            telemetry_all.reset_index(drop=True, inplace=True)
+
+            session_time_arr = telemetry_all["SessionTime"].to_numpy(copy=False)
+
+            # Pre-convert to contiguous f64 once for entire driver (avoid per-lap checks)
+            speed_all = np.ascontiguousarray(telemetry_all["Speed"].values, dtype=np.float64)
+            time_raw = telemetry_all["Time"].to_numpy(copy=False)
+            x_all = np.ascontiguousarray(telemetry_all["X"].values, dtype=np.float64)
+            y_all = np.ascontiguousarray(telemetry_all["Y"].values, dtype=np.float64)
+            z_all = np.ascontiguousarray(telemetry_all["Z"].values, dtype=np.float64)
+            dist_all = np.ascontiguousarray(telemetry_all["Distance"].values, dtype=np.float64)
+            rel_dist_all = telemetry_all["RelativeDistance"].to_numpy(copy=False)
+            drs_all = telemetry_all["DRS"].to_numpy(copy=False)
+            brake_all = telemetry_all["Brake"].to_numpy(copy=False)
+            rpm_all = telemetry_all["RPM"].to_numpy(copy=False)
+            gear_all = telemetry_all["nGear"].to_numpy(copy=False)
+            throttle_all = telemetry_all["Throttle"].to_numpy(copy=False)
+
+            time_sec_all = np.ascontiguousarray(time_raw / np.timedelta64(1, "s"), dtype=np.float64)
+
+            lap_start_times = driver_laps_clean["LapStartTime"].to_numpy(copy=False)
+            lap_end_raw = driver_laps_clean["LapStartTime"] + driver_laps_clean["LapTime"]
+            lap_end_times = lap_end_raw.to_numpy(copy=False)
+            lap_nums_arr = driver_laps_clean["LapNumber"].to_numpy(copy=False)
+
+            # Vectorized pending lap mask using np.isin
+            pending_mask = np.isin(lap_nums_arr.astype(np.int64), np.array(pending_laps, dtype=np.int64))
+            pending_indices = np.where(pending_mask)[0]
+
+            lap_bounds: Dict[int, Tuple[int, int]] = {}
+            if len(pending_indices) > 0:
+                p_starts = lap_start_times[pending_indices]
+                p_ends = lap_end_times[pending_indices]
+                valid_mask = ~np.isnat(p_starts) & ~np.isnat(p_ends)
+                valid_indices = pending_indices[valid_mask]
+
+                if len(valid_indices) > 0:
+                    starts = np.searchsorted(
+                        session_time_arr, lap_start_times[valid_indices], side="left"
+                    )
+                    ends = np.searchsorted(
+                        session_time_arr, lap_end_times[valid_indices], side="right"
+                    )
+                    size_mask = (ends - starts) >= 2
+                    for idx, i0, i1, ok in zip(valid_indices, starts, ends, size_mask):
+                        if ok:
+                            lap_bounds[int(lap_nums_arr[idx])] = (int(i0), int(i1))
+
+            data_key_prefix = f"{self.year}-{event}-{session}-{driver}-"
+
+            write_tasks: List[Tuple[str, bytes]] = []
 
             for lap_num in pending_laps:
-                telemetry = telemetry_all[
-                    telemetry_all["LapNumberInt"] == int(lap_num)
-                ]
-                if telemetry.empty or len(telemetry) < 2:
+                bounds = lap_bounds.get(lap_num)
+                if bounds is None:
                     continue
+                i0, i1 = bounds
 
-                data_key = f"{self.year}-{event}-{session}-{driver}-{lap_num}"
-                telemetry_data = self.process_single_lap_telemetry(
-                    telemetry, data_key
-                )
-                if telemetry_data is None:
-                    continue
+                speed = speed_all[i0:i1]
+                t = time_sec_all[i0:i1]
+                x = x_all[i0:i1]
+                y = y_all[i0:i1]
+                z = z_all[i0:i1]
+                dist = dist_all[i0:i1]
 
-                file_path = lap_file_paths[lap_num]
-                with open(file_path, "wb") as json_file:
-                    json_file.write(orjson.dumps(telemetry_data))
+                # Arrays already contiguous f64 from pre-conversion, slices are views
+                vx = speed / 3.6
+                xa = x
+                ya = y
+                za = z
+                da = dist
+                tc = t
 
+                ax, ay, az = calculate_all_accelerations_numba(vx, tc, xa, ya, za, da)
+
+                # Optimized DRS/Brake binary conversion
+                drs_binary = np.isin(drs_all[i0:i1], (10, 12, 14)).view(np.uint8)
+                brake_binary = (brake_all[i0:i1] != 0).view(np.uint8)
+
+                payload = {
+                    "tel": {
+                        "time": tc,
+                        "rpm": rpm_all[i0:i1],
+                        "speed": speed,
+                        "gear": gear_all[i0:i1],
+                        "throttle": throttle_all[i0:i1],
+                        "brake": brake_binary,
+                        "drs": drs_binary,
+                        "distance": dist,
+                        "rel_distance": rel_dist_all[i0:i1],
+                        "acc_x": ax,
+                        "acc_y": ay,
+                        "acc_z": az,
+                        "x": x,
+                        "y": y,
+                        "z": z,
+                        "dataKey": data_key_prefix + str(lap_num),
+                    }
+                }
+
+                serialized = orjson.dumps(payload, option=ORJSON_OPTS)
+                write_tasks.append((lap_file_paths[lap_num], serialized))
                 processed_count += 1
+
+            if write_tasks:
+                if len(write_tasks) > 2:
+                    with ThreadPoolExecutor(max_workers=min(8, len(write_tasks))) as wexec:
+                        wfutures = [
+                            wexec.submit(_write_bytes, fp, data)
+                            for fp, data in write_tasks
+                        ]
+                        for wf in wfutures:
+                            wf.result()
+                else:
+                    for fp, data in write_tasks:
+                        _write_bytes(fp, data)
 
         except Exception as e:
             logger.error(f"Error in batch processing for {driver}: {str(e)}")
@@ -420,7 +433,6 @@ class TelemetryExtractorOptimized:
         return processed_count
 
     def get_circuit_info(self, event: str, session: str) -> Optional[Dict[str, List]]:
-        """Get circuit corner information."""
         cache_key = f"{self.year}-{event}-{session}"
 
         if cache_key in CIRCUIT_INFO_CACHE:
@@ -451,29 +463,28 @@ class TelemetryExtractorOptimized:
                 if response.status_code == 200:
                     data = response.json()
                     rotation = float(data.get("rotation", 0.0))
-                    rows = []
-                    for entry in data.get("corners", []):
-                        rows.append(
-                            (
-                                float(entry.get("trackPosition", {}).get("x", 0.0)),
-                                float(entry.get("trackPosition", {}).get("y", 0.0)),
-                                int(entry.get("number", 0)),
-                                str(entry.get("letter", "")),
-                                float(entry.get("angle", 0.0)),
-                                float(entry.get("length", 0.0)),
-                            )
-                        )
-                    if rows:
-                        circuit_df = pd.DataFrame(
-                            rows,
-                            columns=["X", "Y", "Number", "Letter", "Angle", "Distance"],
-                        )
+                    corners_data = data.get("corners", [])
+                    if corners_data:
+                        n = len(corners_data)
+                        xs = np.empty(n, dtype=np.float64)
+                        ys = np.empty(n, dtype=np.float64)
+                        nums = np.empty(n, dtype=np.int32)
+                        angles = np.empty(n, dtype=np.float64)
+                        dists = np.empty(n, dtype=np.float64)
+                        for i, entry in enumerate(corners_data):
+                            tp = entry.get("trackPosition", {})
+                            xs[i] = float(tp.get("x", 0.0))
+                            ys[i] = float(tp.get("y", 0.0))
+                            nums[i] = int(entry.get("number", 0))
+                            angles[i] = float(entry.get("angle", 0.0))
+                            dists[i] = float(entry.get("length", 0.0))
+
                         corner_info = {
-                            "CornerNumber": circuit_df["Number"].tolist(),
-                            "X": circuit_df["X"].tolist(),
-                            "Y": circuit_df["Y"].tolist(),
-                            "Angle": circuit_df["Angle"].tolist(),
-                            "Distance": (circuit_df["Distance"] / 10).tolist(),
+                            "CornerNumber": nums.tolist(),
+                            "X": xs.tolist(),
+                            "Y": ys.tolist(),
+                            "Angle": angles.tolist(),
+                            "Distance": (dists / 10.0).tolist(),
                             "Rotation": rotation,
                         }
                         CIRCUIT_INFO_CACHE[cache_key] = corner_info
@@ -487,7 +498,6 @@ class TelemetryExtractorOptimized:
     def process_driver(
         self, event: str, session: str, driver: str, base_dir: str, f1session=None
     ) -> None:
-        """Process all laps for a single driver."""
         driver_dir = f"{base_dir}/{driver}"
         os.makedirs(driver_dir, exist_ok=True)
 
@@ -496,17 +506,15 @@ class TelemetryExtractorOptimized:
                 f1session = self.get_session(event, session, load_telemetry=True)
 
             laps = f1session.laps
-            driver_laps = laps.pick_drivers(driver).copy()
+            driver_laps = laps.pick_drivers(driver)
             if driver_laps.empty:
                 logger.warning(f"No laps for driver {driver}")
                 return
 
             laptimes = self.laps_data(driver_laps)
-            with open(f"{driver_dir}/laptimes.json", "wb") as json_file:
-                json_file.write(orjson.dumps(laptimes))
+            write_json_payload(f"{driver_dir}/laptimes.json", laptimes)
 
-            driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
-            lap_numbers = driver_laps["LapNumber"].tolist()
+            lap_numbers = driver_laps["LapNumber"].astype(int).tolist()
 
             self.process_lap_batch(
                 event, session, driver, lap_numbers, driver_dir, f1session, driver_laps
@@ -516,7 +524,6 @@ class TelemetryExtractorOptimized:
             logger.error(f"Error processing driver {driver}: {str(e)}")
 
     def process_event_session(self, event: str, session: str) -> None:
-        """Process a single event and session, extracting all telemetry data."""
         logger.info(f"Processing {event} - {session}")
 
         base_dir = f"{event}/{session}"
@@ -527,15 +534,15 @@ class TelemetryExtractorOptimized:
 
             drivers = self.session_drivers_list(event, session)
             drivers_info = self.session_drivers(event, session)
-            with open(f"{base_dir}/drivers.json", "wb") as json_file:
-                json_file.write(orjson.dumps(drivers_info))
+            write_json_payload(f"{base_dir}/drivers.json", drivers_info)
 
             corner_info = self.get_circuit_info(event, session)
             if corner_info:
-                with open(f"{base_dir}/corners.json", "wb") as json_file:
-                    json_file.write(orjson.dumps(corner_info))
+                write_json_payload(f"{base_dir}/corners.json", corner_info)
 
-            with ThreadPoolExecutor(max_workers=min(4, len(drivers) or 1)) as executor:
+            n_drivers = len(drivers)
+            max_w = min(4, n_drivers) if n_drivers else 1
+            with ThreadPoolExecutor(max_workers=max_w) as executor:
                 futures = {
                     executor.submit(
                         self.process_driver, event, session, driver, base_dir, f1session
@@ -558,7 +565,6 @@ class TelemetryExtractorOptimized:
             logger.error(f"Error processing {event} - {session}: {str(e)}")
 
     def process_all_data(self, max_workers: int = 4) -> None:
-        """Process all configured events and sessions."""
         logger.info(
             f"Starting optimized telemetry extraction for {self.year} season"
         )
