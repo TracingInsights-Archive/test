@@ -284,122 +284,96 @@ class TelemetryExtractorOptimized:
 
             driver_laps_clean = driver_laps.dropna(subset=["LapNumber"])
 
-            telemetry_all = driver_laps_clean.get_telemetry()
-            if telemetry_all.empty or len(telemetry_all) < 2:
-                return processed_count
-
-            if "SessionTime" not in telemetry_all.columns:
-                logger.warning(
-                    "Telemetry missing SessionTime for %s in %s %s",
-                    driver, event, session,
-                )
-                return processed_count
-
-            if "Distance" not in telemetry_all.columns:
-                telemetry_all = telemetry_all.add_distance()
-            if "RelativeDistance" not in telemetry_all.columns:
-                telemetry_all = telemetry_all.add_relative_distance()
-
-            missing_columns = REQUIRED_TEL_COLUMNS.difference(telemetry_all.columns)
-            if missing_columns:
-                logger.warning(
-                    "Telemetry missing required columns for %s in %s %s: %s",
-                    driver, event, session, sorted(missing_columns),
-                )
-                return processed_count
-
-            telemetry_all.sort_values("Time", inplace=True)
-            telemetry_all.drop_duplicates(subset=["Time"], inplace=True)
-            telemetry_all.reset_index(drop=True, inplace=True)
-
-            session_time_arr = telemetry_all["SessionTime"].to_numpy(copy=False)
-
-            # Pre-convert to contiguous f64 once for entire driver (avoid per-lap checks)
-            speed_all = np.ascontiguousarray(telemetry_all["Speed"].values, dtype=np.float64)
-            time_raw = telemetry_all["Time"].to_numpy(copy=False)
-            x_all = np.ascontiguousarray(telemetry_all["X"].values, dtype=np.float64)
-            y_all = np.ascontiguousarray(telemetry_all["Y"].values, dtype=np.float64)
-            z_all = np.ascontiguousarray(telemetry_all["Z"].values, dtype=np.float64)
-            dist_all = np.ascontiguousarray(telemetry_all["Distance"].values, dtype=np.float64)
-            rel_dist_all = telemetry_all["RelativeDistance"].to_numpy(copy=False)
-            drs_all = telemetry_all["DRS"].to_numpy(copy=False)
-            brake_all = telemetry_all["Brake"].to_numpy(copy=False)
-            rpm_all = telemetry_all["RPM"].to_numpy(copy=False)
-            gear_all = telemetry_all["nGear"].to_numpy(copy=False)
-            throttle_all = telemetry_all["Throttle"].to_numpy(copy=False)
-
-            time_sec_all = np.ascontiguousarray(time_raw / np.timedelta64(1, "s"), dtype=np.float64)
-
-            lap_start_times = driver_laps_clean["LapStartTime"].to_numpy(copy=False)
-            lap_end_raw = driver_laps_clean["LapStartTime"] + driver_laps_clean["LapTime"]
-            lap_end_times = lap_end_raw.to_numpy(copy=False)
-            lap_nums_arr = driver_laps_clean["LapNumber"].to_numpy(copy=False)
-
-            # Vectorized pending lap mask using np.isin
-            pending_mask = np.isin(lap_nums_arr.astype(np.int64), np.array(pending_laps, dtype=np.int64))
-            pending_indices = np.where(pending_mask)[0]
-
-            lap_bounds: Dict[int, Tuple[int, int]] = {}
-            if len(pending_indices) > 0:
-                p_starts = lap_start_times[pending_indices]
-                p_ends = lap_end_times[pending_indices]
-                valid_mask = ~np.isnat(p_starts) & ~np.isnat(p_ends)
-                valid_indices = pending_indices[valid_mask]
-
-                if len(valid_indices) > 0:
-                    starts = np.searchsorted(
-                        session_time_arr, lap_start_times[valid_indices], side="left"
-                    )
-                    ends = np.searchsorted(
-                        session_time_arr, lap_end_times[valid_indices], side="right"
-                    )
-                    size_mask = (ends - starts) >= 2
-                    for idx, i0, i1, ok in zip(valid_indices, starts, ends, size_mask):
-                        if ok:
-                            lap_bounds[int(lap_nums_arr[idx])] = (int(i0), int(i1))
+            pending_laps_data = driver_laps_clean[driver_laps_clean["LapNumber"].isin(pending_laps)]
 
             data_key_prefix = f"{self.year}-{event}-{session}-{driver}-"
-
             write_tasks: List[Tuple[str, bytes]] = []
 
-            for lap_num in pending_laps:
-                bounds = lap_bounds.get(lap_num)
-                if bounds is None:
+            for _, lap in pending_laps_data.iterrows():
+                lap_num = int(lap["LapNumber"])
+                try:
+                    telemetry = lap.get_telemetry()
+                except Exception:
                     continue
-                i0, i1 = bounds
 
-                speed = speed_all[i0:i1]
-                t = time_sec_all[i0:i1]
-                x = x_all[i0:i1]
-                y = y_all[i0:i1]
-                z = z_all[i0:i1]
-                dist = dist_all[i0:i1]
+                if telemetry.empty or len(telemetry) < 2:
+                    continue
 
-                # Arrays already contiguous f64 from pre-conversion, slices are views
+                # Add distance if missing
+                if "Distance" not in telemetry.columns:
+                    telemetry = telemetry.add_distance()
+                if "RelativeDistance" not in telemetry.columns:
+                    telemetry = telemetry.add_relative_distance()
+
+                # Check required columns
+                if not REQUIRED_TEL_COLUMNS.issubset(telemetry.columns):
+                    continue
+
+                # Conversion (using to_numpy(copy=False) to avoid copy if possible)
+                # But telemetry from get_telemetry() might need to be cast to float/etc.
+                # FastF1 usually returns float for Speed, RPM, etc.
+
+                # Calculate vx (m/s)
+                # Speed is already in km/h, usually float.
+                speed = telemetry["Speed"].to_numpy(copy=False)
                 vx = speed / 3.6
-                xa = x
-                ya = y
-                za = z
-                da = dist
-                tc = t
 
-                ax, ay, az = calculate_all_accelerations_numba(vx, tc, xa, ya, za, da)
+                # Time
+                time_raw = telemetry["Time"].to_numpy(copy=False)
+                # Ensure time is float seconds
+                t = time_raw / np.timedelta64(1, "s")
 
-                # Optimized DRS/Brake binary conversion
-                drs_binary = np.isin(drs_all[i0:i1], (10, 12, 14)).view(np.uint8)
-                brake_binary = (brake_all[i0:i1] != 0).view(np.uint8)
+                # Other arrays
+                x = telemetry["X"].to_numpy(copy=False)
+                y = telemetry["Y"].to_numpy(copy=False)
+                z = telemetry["Z"].to_numpy(copy=False)
+                dist = telemetry["Distance"].to_numpy(copy=False)
 
+                # Ensure contiguous f64 for Numba
+                vx = _ensure_contiguous_f64(vx)
+                t = _ensure_contiguous_f64(t)
+                x = _ensure_contiguous_f64(x)
+                y = _ensure_contiguous_f64(y)
+                z = _ensure_contiguous_f64(z)
+                dist = _ensure_contiguous_f64(dist)
+
+                # Numba acceleration
+                ax, ay, az = calculate_all_accelerations_numba(vx, t, x, y, z, dist)
+
+                # Prepare payload arrays
+                rel_dist = telemetry["RelativeDistance"].to_numpy(copy=False)
+                rpm = telemetry["RPM"].to_numpy(copy=False)
+                gear = telemetry["nGear"].to_numpy(copy=False)
+                throttle = telemetry["Throttle"].to_numpy(copy=False)
+                brake = telemetry["Brake"].to_numpy(copy=False)
+                drs = telemetry["DRS"].to_numpy(copy=False)
+
+                # Binary conversion for Brake/DRS (match original logic: list comprehension or apply)
+                # Original: lambda x: 1 if x in [10, 12, 14] else 0
+                # Optimized: np.isin().view(np.uint8) or astype(np.int8)
+                # To match exactly orig output (which uses int Python lists), we need to check types
+                # Original `race_original.py`:
+                # acc_tel["DRS"] = acc_tel["DRS"].apply(...) -> int64 or int32 series
+                # We can use numpy for this safely if values match.
+
+                drs_binary = np.isin(drs, [10, 12, 14]).astype(np.int8)
+                # Original Brake: lambda x: 1 if x == True else 0.
+                # If Brake is boolean or int in input:
+                brake_binary = (brake != 0).astype(np.int8)
+
+                # Construct payload dict
+                # Note: using numpy arrays directly for orjson
                 payload = {
                     "tel": {
-                        "time": tc,
-                        "rpm": rpm_all[i0:i1],
+                        "time": t,
+                        "rpm": rpm,
                         "speed": speed,
-                        "gear": gear_all[i0:i1],
-                        "throttle": throttle_all[i0:i1],
+                        "gear": gear,
+                        "throttle": throttle,
                         "brake": brake_binary,
                         "drs": drs_binary,
                         "distance": dist,
-                        "rel_distance": rel_dist_all[i0:i1],
+                        "rel_distance": rel_dist,
                         "acc_x": ax,
                         "acc_y": ay,
                         "acc_z": az,
