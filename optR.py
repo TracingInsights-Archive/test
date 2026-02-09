@@ -320,6 +320,21 @@ class TelemetryExtractorOptimized:
             }
         }
 
+    def _fetch_single_lap_telemetry(
+        self, driver_laps: pd.DataFrame, lap_num: int
+    ) -> Optional[pd.DataFrame]:
+        """Fetch telemetry for a single lap via per-lap get_telemetry (fallback)."""
+        try:
+            selected_lap = driver_laps[driver_laps.LapNumber == lap_num]
+            if selected_lap.empty:
+                return None
+            tel = selected_lap.get_telemetry()
+            if tel.empty:
+                return None
+            return tel
+        except Exception:
+            return None
+
     def process_lap_batch(
         self,
         event: str,
@@ -335,6 +350,7 @@ class TelemetryExtractorOptimized:
             return 0
 
         processed_count = 0
+        lap_number_set = set(lap_numbers)
 
         try:
             if f1session is None:
@@ -344,38 +360,48 @@ class TelemetryExtractorOptimized:
                 laps = f1session.laps
                 driver_laps = laps.pick_drivers(driver).copy()
 
-            all_telemetry = driver_laps.get_telemetry()
-            if all_telemetry.empty:
-                return 0
+            telemetry_by_lap: Dict[int, pd.DataFrame] = {}
 
-            has_lap_number = "LapNumber" in all_telemetry.columns
-
-            if has_lap_number:
-                telemetry_by_lap = {
-                    int(lap_num): group
-                    for lap_num, group in all_telemetry.groupby("LapNumber", sort=False)
-                }
-            else:
-                telemetry_by_lap = {}
-                tel_time = all_telemetry["Time"].values
-                lap_numbers_set = set(lap_numbers)
-                for _, lap_row in driver_laps.iterrows():
-                    lap_num = int(lap_row["LapNumber"])
-                    if lap_num not in lap_numbers_set:
-                        continue
-                    try:
-                        lap_start = lap_row["LapStartTime"]
-                        lap_end = lap_start + lap_row["LapTime"]
-                        if pd.isna(lap_start) or pd.isna(lap_end):
-                            continue
-                        start_ns = lap_start.value
-                        end_ns = lap_end.value
-                        mask = (tel_time >= start_ns) & (tel_time <= end_ns)
-                        lap_tel = all_telemetry[mask]
-                        if not lap_tel.empty:
-                            telemetry_by_lap[lap_num] = lap_tel
-                    except Exception:
-                        pass
+            try:
+                all_telemetry = driver_laps.get_telemetry()
+                if not all_telemetry.empty:
+                    if "LapNumber" in all_telemetry.columns:
+                        telemetry_by_lap = {
+                            int(lap_num): group
+                            for lap_num, group in all_telemetry.groupby(
+                                "LapNumber", sort=False
+                            )
+                            if not pd.isna(lap_num)
+                        }
+                    elif "LapNumber" in all_telemetry.index.names:
+                        telemetry_by_lap = {
+                            int(lap_num): group
+                            for lap_num, group in all_telemetry.groupby(
+                                level="LapNumber", sort=False
+                            )
+                            if not pd.isna(lap_num)
+                        }
+                    else:
+                        tel_time = all_telemetry["Time"]
+                        for _, lap_row in driver_laps.iterrows():
+                            lap_num = int(lap_row["LapNumber"])
+                            if lap_num not in lap_number_set:
+                                continue
+                            try:
+                                lap_start = lap_row["LapStartTime"]
+                                lap_end = lap_start + lap_row["LapTime"]
+                                if pd.isna(lap_start) or pd.isna(lap_end):
+                                    continue
+                                mask = (tel_time >= lap_start) & (tel_time <= lap_end)
+                                lap_tel = all_telemetry.loc[mask]
+                                if not lap_tel.empty:
+                                    telemetry_by_lap[lap_num] = lap_tel
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(
+                    f"Bulk telemetry fetch failed for {driver}, falling back to per-lap: {e}"
+                )
 
             for lap_num in lap_numbers:
                 file_path = f"{driver_dir}/{lap_num}_tel.json"
@@ -386,8 +412,15 @@ class TelemetryExtractorOptimized:
 
                 try:
                     lap_tel = telemetry_by_lap.get(lap_num)
-                    if lap_tel is None or lap_tel.empty:
-                        continue
+                    if lap_tel is None or (hasattr(lap_tel, "empty") and lap_tel.empty):
+                        lap_tel = self._fetch_single_lap_telemetry(
+                            driver_laps, lap_num
+                        )
+                        if lap_tel is None:
+                            logger.warning(
+                                f"No telemetry for {driver} lap {lap_num}"
+                            )
+                            continue
 
                     data_key = f"{self.year}-{event}-{session}-{driver}-{lap_num}"
                     telemetry_data = self.process_single_lap_telemetry(
