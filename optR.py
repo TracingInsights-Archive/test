@@ -312,8 +312,7 @@ class TelemetryExtractorOptimized:
     ) -> int:
         """Process laps and write individual telemetry files.
 
-        Fetches telemetry per-lap to ensure every lap is captured,
-        matching the original race.py behavior.
+        Fetches telemetry once per driver, then splits by lap.
         """
         if not lap_numbers:
             return 0
@@ -341,14 +340,58 @@ class TelemetryExtractorOptimized:
                 laps = f1session.laps
                 driver_laps = laps.pick_drivers(driver).copy()
 
+            telemetry_all = driver_laps.get_telemetry()
+            if telemetry_all.empty or len(telemetry_all) < 2:
+                return processed_count
+
+            if "Distance" not in telemetry_all.columns:
+                telemetry_all = telemetry_all.add_distance()
+            if "RelativeDistance" not in telemetry_all.columns:
+                telemetry_all = telemetry_all.add_relative_distance()
+
+            if "LapNumber" not in telemetry_all.columns:
+                logger.warning(
+                    f"Telemetry missing LapNumber for {driver} in {event} {session}"
+                )
+                return processed_count
+
+            required_columns = {
+                "Speed",
+                "Time",
+                "X",
+                "Y",
+                "Z",
+                "Distance",
+                "RelativeDistance",
+                "DRS",
+                "Brake",
+                "RPM",
+                "nGear",
+                "Throttle",
+            }
+            missing_columns = required_columns.difference(telemetry_all.columns)
+            if missing_columns:
+                logger.warning(
+                    "Telemetry missing required columns for %s in %s %s: %s",
+                    driver,
+                    event,
+                    session,
+                    sorted(missing_columns),
+                )
+                return processed_count
+
+            telemetry_all = telemetry_all.sort_values("Time").drop_duplicates(
+                subset=["Time"]
+            )
+            telemetry_all = telemetry_all.reset_index(drop=True)
+            telemetry_all = telemetry_all.dropna(subset=["LapNumber"])
+            telemetry_all["LapNumberInt"] = telemetry_all["LapNumber"].astype(int)
+
             for lap_num in pending_laps:
                 try:
-                    selected_lap = driver_laps[driver_laps["LapNumber"] == lap_num]
-                    if selected_lap.empty:
-                        logger.warning(f"No data for {driver} lap {lap_num} in {event} {session}")
-                        continue
-
-                    telemetry = selected_lap.get_telemetry()
+                    telemetry = telemetry_all[
+                        telemetry_all["LapNumberInt"] == int(lap_num)
+                    ]
                     if telemetry.empty or len(telemetry) < 2:
                         continue
 
