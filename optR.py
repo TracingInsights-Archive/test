@@ -224,7 +224,7 @@ class TelemetryExtractor:
         self.use_joblib = use_joblib
         self.n_jobs = n_jobs
         self.batch_size = batch_size
-        self.events = events or ["Abu Dhabi Grand Prix"]
+        self.events = events or ["Australian Grand Prix"]
         self.sessions = sessions or ["Race"]
 
     def get_session(
