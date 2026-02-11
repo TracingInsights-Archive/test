@@ -358,6 +358,7 @@ class TelemetryExtractor:
         driver_laps: pd.DataFrame,
         event: str,
         session: str,
+        all_tel=None,
     ) -> bool:
         file_path = f"{driver_dir}/{lap_number}_tel.json"
         try:
@@ -366,7 +367,10 @@ class TelemetryExtractor:
                 logger.warning(f"No data for {driver} lap {lap_number} in {event} {session}")
                 return False
 
-            telemetry = selected.get_telemetry()
+            if all_tel is not None:
+                telemetry = all_tel.slice_by_lap(selected, interpolate_edges=True)
+            else:
+                telemetry = selected.get_telemetry()
             data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
             tel_data = _process_telemetry_to_dict(telemetry, data_key)
             _write_json(file_path, tel_data)
@@ -396,12 +400,25 @@ class TelemetryExtractor:
             # Pre-collect existing files to avoid per-lap os.path.exists syscalls
             existing = set(os.listdir(driver_dir)) if os.path.isdir(driver_dir) else set()
 
-            for lap_number in lap_numbers:
-                fname = f"{lap_number}_tel.json"
-                if fname in existing:
-                    continue
+            # Check if any laps need processing before doing the expensive bulk call
+            laps_to_process = [
+                ln for ln in lap_numbers if f"{ln}_tel.json" not in existing
+            ]
+
+            if not laps_to_process:
+                return
+
+            # Bulk telemetry: one merge/resample for ALL laps instead of N per-lap.
+            # ~13x faster than calling get_telemetry() per lap individually.
+            try:
+                all_tel = driver_laps.get_telemetry()
+            except Exception:
+                all_tel = None
+
+            for lap_number in laps_to_process:
                 self._process_single_lap(
-                    driver, lap_number, driver_dir, driver_laps, event, session
+                    driver, lap_number, driver_dir, driver_laps, event, session,
+                    all_tel=all_tel,
                 )
 
         except Exception as e:
