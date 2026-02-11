@@ -117,6 +117,31 @@ def _col_to_list_bool_or_none(series: pd.Series) -> list:
         out = vals.astype(bool)
     return out.tolist()
 
+def _array_to_list_float_or_none(arr: np.ndarray) -> list:
+    """Convert numpy array to list, replacing NaN/inf with 'None'."""
+    if arr.size == 0:
+        return []
+    mask = ~np.isfinite(arr)
+    if not mask.any():
+        return arr.tolist()
+    out = np.empty(arr.shape, dtype=object)
+    out[mask] = "None"
+    out[~mask] = arr[~mask]
+    return out.tolist()
+
+
+def _array_to_list_int_or_none(arr: np.ndarray) -> list:
+    """Convert numpy array to list, replacing NaN/inf with 'None'."""
+    if arr.size == 0:
+        return []
+    mask = ~np.isfinite(arr)
+    if not mask.any():
+        return arr.astype(int).tolist()
+    out = np.empty(arr.shape, dtype=object)
+    out[mask] = "None"
+    out[~mask] = arr[~mask].astype(int)
+    return out.tolist()
+
 
 def _smooth_outliers(arr: np.ndarray, threshold: float, use_abs: bool) -> None:
     """In-place outlier replacement: arr[i] = arr[i-1] where exceeds threshold."""
