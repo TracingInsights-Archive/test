@@ -66,9 +66,12 @@ def _write_json(path: str, obj) -> None:
 def _td_col_to_seconds(series: pd.Series) -> list:
     if series.empty:
         return []
-    seconds = series.dt.total_seconds().to_numpy()
+    # Use view for faster NA detection and avoid intermediate arrays
     mask = series.isna().to_numpy()
-    out = np.round(seconds, 3).astype(object)
+    seconds = series.dt.total_seconds().to_numpy()
+    # In-place rounding and conversion to object
+    out = np.empty(len(seconds), dtype=object)
+    out[~mask] = np.round(seconds[~mask], 3)
     out[mask] = "None"
     return out.tolist()
 
@@ -79,8 +82,11 @@ def _col_to_list_str_or_none(series: pd.Series) -> list:
     vals = series.to_numpy()
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
-    out[mask] = "None"
-    out[~mask] = vals[~mask].astype(str)
+    if mask.any():
+        out[mask] = "None"
+        out[~mask] = vals[~mask].astype(str)
+    else:
+        out = vals.astype(str)
     return out.tolist()
 
 
@@ -90,8 +96,11 @@ def _col_to_list_int_or_none(series: pd.Series) -> list:
     vals = series.to_numpy()
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
-    out[mask] = "None"
-    out[~mask] = vals[~mask].astype(int)
+    if mask.any():
+        out[mask] = "None"
+        out[~mask] = vals[~mask].astype(int)
+    else:
+        out = vals.astype(int)
     return out.tolist()
 
 
@@ -101,8 +110,11 @@ def _col_to_list_bool_or_none(series: pd.Series) -> list:
     vals = series.to_numpy()
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
-    out[mask] = "None"
-    out[~mask] = vals[~mask].astype(bool)
+    if mask.any():
+        out[mask] = "None"
+        out[~mask] = vals[~mask].astype(bool)
+    else:
+        out = vals.astype(bool)
     return out.tolist()
 
 
@@ -127,17 +139,19 @@ def _compute_accelerations(
     z: np.ndarray,
     dist: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    # Convert speed km/h -> m/s as float64
+    # Convert speed km/h -> m/s as float64, avoid copies when possible
     vx = speed * (1.0 / 3.6)
     if vx.dtype != np.float64:
-        vx = vx.astype(np.float64)
-    time_f = (time_arr / np.timedelta64(1, "s")).astype(np.float64)
+        vx = vx.astype(np.float64, copy=False)
 
-    # Ensure float64 only when needed
-    x_f = x if x.dtype == np.float64 else x.astype(np.float64)
-    y_f = y if y.dtype == np.float64 else y.astype(np.float64)
-    z_f = z if z.dtype == np.float64 else z.astype(np.float64)
-    dist_f = dist if dist.dtype == np.float64 else dist.astype(np.float64)
+    # Faster timedelta64 to float64 conversion using view
+    time_f = time_arr.view("timedelta64[ns]").astype(np.float64) / 1e9
+
+    # Ensure float64 without unnecessary copies
+    x_f = x if x.dtype == np.float64 else x.astype(np.float64, copy=False)
+    y_f = y if y.dtype == np.float64 else y.astype(np.float64, copy=False)
+    z_f = z if z.dtype == np.float64 else z.astype(np.float64, copy=False)
+    dist_f = dist if dist.dtype == np.float64 else dist.astype(np.float64, copy=False)
 
     # --- X acceleration ---
     dtime = np.gradient(time_f)
@@ -148,10 +162,12 @@ def _compute_accelerations(
     # --- Shared gradient for Y and Z ---
     dx = np.gradient(x_f)
     ds = np.gradient(dist_f)
+    # Pre-compute epsilon addition once
+    dx_eps = dx + EPS
 
     # --- Y acceleration ---
     dy = np.gradient(y_f)
-    theta = np.arctan2(dy, dx + EPS)
+    theta = np.arctan2(dy, dx_eps)
     theta[0] = theta[1]
     dtheta = np.gradient(np.unwrap(theta))
     _smooth_outliers(dtheta, 0.5, use_abs=True)
@@ -162,7 +178,7 @@ def _compute_accelerations(
 
     # --- Z acceleration ---
     dz = np.gradient(z_f)
-    z_theta = np.arctan2(dz, dx + EPS)
+    z_theta = np.arctan2(dz, dx_eps)
     z_theta[0] = z_theta[1]
     z_dtheta = np.gradient(np.unwrap(z_theta))
     _smooth_outliers(z_dtheta, 0.5, use_abs=True)
@@ -190,21 +206,21 @@ def _process_telemetry_to_dict(telemetry: pd.DataFrame, data_key: str) -> dict:
 
     return {
         "tel": {
-            "time": time_s,
-            "rpm": telemetry["RPM"].to_numpy(),
-            "speed": speed,
-            "gear": telemetry["nGear"].to_numpy(),
-            "throttle": telemetry["Throttle"].to_numpy(),
-            "brake": brake,
-            "drs": drs,
-            "distance": dist,
-            "rel_distance": telemetry["RelativeDistance"].to_numpy(),
-            "acc_x": ax,
-            "acc_y": ay,
-            "acc_z": az,
-            "x": x,
-            "y": y,
-            "z": z,
+            "time": _array_to_list_float_or_none(time_s),
+            "rpm": _array_to_list_float_or_none(telemetry["RPM"].to_numpy()),
+            "speed": _array_to_list_float_or_none(speed),
+            "gear": _array_to_list_int_or_none(telemetry["nGear"].to_numpy()),
+            "throttle": _array_to_list_float_or_none(telemetry["Throttle"].to_numpy()),
+            "brake": _array_to_list_int_or_none(brake),
+            "drs": _array_to_list_int_or_none(drs),
+            "distance": _array_to_list_float_or_none(dist),
+            "rel_distance": _array_to_list_float_or_none(telemetry["RelativeDistance"].to_numpy()),
+            "acc_x": _array_to_list_float_or_none(ax),
+            "acc_y": _array_to_list_float_or_none(ay),
+            "acc_z": _array_to_list_float_or_none(az),
+            "x": _array_to_list_float_or_none(x),
+            "y": _array_to_list_float_or_none(y),
+            "z": _array_to_list_float_or_none(z),
             "dataKey": data_key,
         }
     }
@@ -224,7 +240,7 @@ class TelemetryExtractor:
         self.use_joblib = use_joblib
         self.n_jobs = n_jobs
         self.batch_size = batch_size
-        self.events = events or ["Australian Grand Prix"]
+        self.events = events or ["Abu Dhabi Grand Prix"]
         self.sessions = sessions or ["Race"]
 
     def get_session(
