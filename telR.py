@@ -1,11 +1,11 @@
+import json
 import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fastf1
-import msgspec
 import numpy as np
 import pandas as pd
 import requests
@@ -39,125 +39,8 @@ CIRCUIT_INFO_CACHE = {}
 memory = Memory(location='./cache_joblib', verbose=0)
 
 
-# ============================================================================
-# MSGSPEC STRUCTS - Type-safe, high-performance data structures
-# ============================================================================
-
-class TelemetryData(msgspec.Struct, kw_only=True, array_like=True):
-    """Optimized telemetry data structure with msgspec."""
-    time: list[float]
-    rpm: list[int]
-    speed: list[float]
-    gear: list[int]
-    throttle: list[int]
-    brake: list[int]
-    drs: list[int]
-    distance: list[float]
-    rel_distance: list[float]
-    acc_x: list[float]
-    acc_y: list[float]
-    acc_z: list[float]
-    x: list[float]
-    y: list[float]
-    z: list[float]
-    dataKey: str
-
-
-class TelemetryWrapper(msgspec.Struct, kw_only=True):
-    """Wrapper for telemetry data."""
-    tel: TelemetryData
-
-
-class LapData(msgspec.Struct, kw_only=True, array_like=True):
-    """Optimized lap data structure."""
-    time: list[Union[float, str]]  # Can be float or "None"
-    lap: list[int]
-    compound: list[str]
-    stint: list[Union[int, str]]
-    s1: list[Union[float, str]]
-    s2: list[Union[float, str]]
-    s3: list[Union[float, str]]
-    life: list[Union[int, str]]
-    pos: list[Union[int, str]]
-    status: list[str]
-    pb: list[Union[bool, str]]
-
-
-class DriverInfo(msgspec.Struct, kw_only=True):
-    """Driver information structure."""
-    driver: str
-    team: str
-
-
-class DriversData(msgspec.Struct, kw_only=True):
-    """Wrapper for drivers data."""
-    drivers: list[DriverInfo]
-
-
-class CircuitInfo(msgspec.Struct, kw_only=True, array_like=True):
-    """Circuit corner information."""
-    CornerNumber: list[int]
-    X: list[float]
-    Y: list[float]
-    Angle: list[float]
-    Distance: list[float]
-    Rotation: float
-
-
-# ============================================================================
-# MSGSPEC ENCODERS/DECODERS - Ultra-fast serialization
-# ============================================================================
-
-# Use MessagePack for binary encoding (faster than JSON)
-# For compatibility, you can also use JSONEncoder
-encoder = msgspec.msgpack.Encoder()
-decoder_telemetry = msgspec.msgpack.Decoder(TelemetryWrapper)
-decoder_lap = msgspec.msgpack.Decoder(LapData)
-decoder_drivers = msgspec.msgpack.Decoder(DriversData)
-decoder_circuit = msgspec.msgpack.Decoder(CircuitInfo)
-
-# JSON encoders/decoders as fallback (still faster than stdlib json)
-json_encoder = msgspec.json.Encoder()
-json_decoder_telemetry = msgspec.json.Decoder(TelemetryWrapper)
-json_decoder_lap = msgspec.json.Decoder(LapData)
-json_decoder_drivers = msgspec.json.Decoder(DriversData)
-json_decoder_circuit = msgspec.json.Decoder(CircuitInfo)
-
-
-# ============================================================================
-# OPTIMIZED FILE I/O FUNCTIONS
-# ============================================================================
-
-def write_msgpack(data: msgspec.Struct, filepath: str) -> None:
-    """Write msgspec struct to file using MessagePack format."""
-    with open(filepath, "wb") as f:
-        f.write(encoder.encode(data))
-
-
-def write_json(data: msgspec.Struct, filepath: str) -> None:
-    """Write msgspec struct to file using JSON format (for readability)."""
-    with open(filepath, "wb") as f:
-        f.write(json_encoder.encode(data))
-
-
-def read_msgpack(filepath: str, decoder) -> msgspec.Struct:
-    """Read msgpack file and decode to struct."""
-    with open(filepath, "rb") as f:
-        return decoder.decode(f.read())
-
-
-def read_json(filepath: str, decoder) -> msgspec.Struct:
-    """Read JSON file and decode to struct."""
-    with open(filepath, "rb") as f:
-        return decoder.decode(f.read())
-
-
-# ============================================================================
-# TELEMETRY EXTRACTOR CLASS
-# ============================================================================
-
 class TelemetryExtractor:
-    """Optimized class to handle extraction of F1 telemetry data with msgspec."""
+    """Optimized class to handle extraction of F1 telemetry data with joblib improvements."""
 
     def __init__(
         self,
@@ -167,18 +50,12 @@ class TelemetryExtractor:
         use_joblib: bool = True,
         n_jobs: int = -1,
         batch_size: int = 8,
-        use_msgpack: bool = True,  # New option for binary format
     ):
         """Initialize the TelemetryExtractor."""
         self.year = year
         self.use_joblib = use_joblib
-        self.n_jobs = n_jobs
-        self.batch_size = batch_size
-        self.use_msgpack = use_msgpack  # Use MessagePack for better performance
-        
-        # File extensions
-        self.ext = ".msgpack" if use_msgpack else ".json"
-        self.write_func = write_msgpack if use_msgpack else write_json
+        self.n_jobs = n_jobs  # -1 uses all available cores
+        self.batch_size = batch_size  # Laps per batch for joblib processing
         
         self.events = events or [
             # "Pre-Season Testing",
@@ -196,7 +73,7 @@ class TelemetryExtractor:
             # "British Grand Prix",
             # "Belgian Grand Prix",
             # "Hungarian Grand Prix",
-            "Dutch Grand Prix",
+            # "Dutch Grand Prix",
             # 'Italian Grand Prix',
             # 'Azerbaijan Grand Prix',
             # 'Singapore Grand Prix',
@@ -205,9 +82,9 @@ class TelemetryExtractor:
             # 'São Paulo Grand Prix',
             # 'Las Vegas Grand Prix',
             # 'Qatar Grand Prix',
-            # 'Abu Dhabi Grand Prix', 
-            ]   
-        self.sessions = sessions or ["Practice 1"]
+            'Abu Dhabi Grand Prix',
+        ]
+        self.sessions = sessions or ["Race"]
 
     def get_session(
         self, event: Union[str, int], session: str, load_telemetry: bool = False
@@ -231,7 +108,7 @@ class TelemetryExtractor:
 
     def session_drivers(
         self, event: Union[str, int], session: str
-    ) -> DriversData:
+    ) -> Dict[str, List[Dict[str, str]]]:
         """Get drivers available for a given event and session."""
         try:
             f1session = self.get_session(event, session)
@@ -242,21 +119,21 @@ class TelemetryExtractor:
             unique_drivers = laps["Driver"].unique()
 
             drivers = [
-                DriverInfo(
-                    driver=driver,
-                    team=laps[laps.Driver == driver].Team.iloc[0],
-                )
+                {
+                    "driver": driver,
+                    "team": laps[laps.Driver == driver].Team.iloc[0],
+                }
                 for driver in unique_drivers
             ]
 
-            return DriversData(drivers=drivers)
+            return {"drivers": drivers}
         except Exception as e:
             logger.error(f"Error getting drivers for {event} {session}: {str(e)}")
-            return DriversData(drivers=[])
+            return {"drivers": []}
 
     def laps_data(
         self, event: Union[str, int], session: str, driver: str, f1session=None
-    ) -> LapData:
+    ) -> Dict[str, List]:
         """Get lap data for a specific driver in a session."""
         try:
             if f1session is None:
@@ -265,64 +142,106 @@ class TelemetryExtractor:
             laps = f1session.laps
             driver_laps = laps.pick_drivers(driver).copy()
 
-            # Helper function to convert timedelta to seconds or "None"
+            # Helper function to convert timedelta to seconds
             def timedelta_to_seconds(time_value):
                 if pd.isna(time_value) or not hasattr(time_value, "total_seconds"):
                     return "None"
                 return round(time_value.total_seconds(), 3)
 
-            # Helper for nullable int values
-            def nullable_int(value):
-                return "None" if pd.isna(value) else int(value)
-            
-            # Helper for nullable bool values
-            def nullable_bool(value):
-                return "None" if pd.isna(value) else bool(value)
-            
-            # Helper for nullable string values
-            def nullable_str(value):
-                return "None" if pd.isna(value) else str(value)
+            # Convert lap times to seconds and handle NaN values
+            lap_times = [
+                timedelta_to_seconds(lap_time) for lap_time in driver_laps["LapTime"]
+            ]
 
-            # Convert lap times to seconds
-            lap_times = [timedelta_to_seconds(lt) for lt in driver_laps["LapTime"]]
-            sector1_times = [timedelta_to_seconds(s1) for s1 in driver_laps["Sector1Time"]]
-            sector2_times = [timedelta_to_seconds(s2) for s2 in driver_laps["Sector2Time"]]
-            sector3_times = [timedelta_to_seconds(s3) for s3 in driver_laps["Sector3Time"]]
+            # Convert sector times to seconds
+            sector1_times = [
+                timedelta_to_seconds(s1_time) for s1_time in driver_laps["Sector1Time"]
+            ]
+            sector2_times = [
+                timedelta_to_seconds(s2_time) for s2_time in driver_laps["Sector2Time"]
+            ]
+            sector3_times = [
+                timedelta_to_seconds(s3_time) for s3_time in driver_laps["Sector3Time"]
+            ]
 
-            # Handle compounds (nullable string)
-            compounds = [nullable_str(c) if pd.isna(c) else c for c in driver_laps["Compound"]]
+            # Handle NaN values in compounds
+            compounds = []
+            for compound in driver_laps["Compound"]:
+                if pd.isna(compound):
+                    compounds.append("None")
+                else:
+                    compounds.append(compound)
 
-            # Create LapData struct
-            return LapData(
-                time=lap_times,
-                lap=driver_laps["LapNumber"].tolist(),
-                compound=compounds,
-                stint=[nullable_int(s) for s in driver_laps["Stint"]],
-                s1=sector1_times,
-                s2=sector2_times,
-                s3=sector3_times,
-                life=[nullable_int(life) for life in driver_laps["TyreLife"]],
-                pos=[nullable_int(pos) for pos in driver_laps["Position"]],
-                status=[nullable_str(status) for status in driver_laps["TrackStatus"]],
-                pb=[nullable_bool(pb) for pb in driver_laps["IsPersonalBest"]],
-            )
+            # Handle stint information
+            stints = []
+            for stint in driver_laps["Stint"]:
+                if pd.isna(stint):
+                    stints.append("None")
+                else:
+                    stints.append(int(stint))
+
+            # Handle TyreLife
+            tyre_life = []
+            for life in driver_laps["TyreLife"]:
+                if pd.isna(life):
+                    tyre_life.append("None")
+                else:
+                    tyre_life.append(int(life))
+
+            # Handle Position
+            positions = []
+            for pos in driver_laps["Position"]:
+                if pd.isna(pos):
+                    positions.append("None")
+                else:
+                    positions.append(int(pos))
+
+            # Handle TrackStatus
+            track_status = []
+            for status in driver_laps["TrackStatus"]:
+                if pd.isna(status):
+                    track_status.append("None")
+                else:
+                    track_status.append(str(status))
+
+            # Handle IsPersonalBest
+            is_personal_best = []
+            for is_pb in driver_laps["IsPersonalBest"]:
+                if pd.isna(is_pb):
+                    is_personal_best.append("None")
+                else:
+                    is_personal_best.append(bool(is_pb))
+
+            return {
+                "time": lap_times,
+                "lap": driver_laps["LapNumber"].tolist(),
+                "compound": compounds,
+                "stint": stints,
+                "s1": sector1_times,
+                "s2": sector2_times,
+                "s3": sector3_times,
+                "life": tyre_life,
+                "pos": positions,
+                "status": track_status,
+                "pb": is_personal_best,
+            }
         except Exception as e:
             logger.error(
                 f"Error getting lap data for {driver} in {event} {session}: {str(e)}"
             )
-            return LapData(
-                time=[],
-                lap=[],
-                compound=[],
-                stint=[],
-                s1=[],
-                s2=[],
-                s3=[],
-                life=[],
-                pos=[],
-                status=[],
-                pb=[],
-            )
+            return {
+                "time": [],
+                "lap": [],
+                "compound": [],
+                "stint": [],
+                "s1": [],
+                "s2": [],
+                "s3": [],
+                "life": [],
+                "pos": [],
+                "status": [],
+                "pb": [],
+            }
 
     @staticmethod
     @memory.cache
@@ -344,13 +263,16 @@ class TelemetryExtractor:
     @memory.cache
     def calculate_y_acceleration(vx_array, x_array, y_array, dist_array, Nay):
         """Calculate and smooth Y-acceleration component using joblib caching."""
+        # Calculate gradients
         dx = np.gradient(x_array)
         dy = np.gradient(y_array)
 
+        # Calculate theta (angle in xy-plane)
         theta = np.arctan2(dy, (dx + np.finfo(float).eps))
         theta[0] = theta[1]
         theta_noDiscont = np.unwrap(theta)
 
+        # Calculate distance and curvature
         ds = np.gradient(dist_array)
         dtheta = np.gradient(theta_noDiscont)
 
@@ -359,12 +281,15 @@ class TelemetryExtractor:
             if abs(dtheta[i]) > 0.5:
                 dtheta[i] = dtheta[i - 1]
 
-        C = dtheta / (ds + 0.0001)
+        # Calculate curvature and lateral acceleration
+        C = dtheta / (ds + 0.0001)  # To avoid division by 0
         ay = np.square(vx_array) * C
 
+        # Remove extreme values
         indexProblems = np.abs(ay) > 150
         ay[indexProblems] = 0
 
+        # Smooth y-acceleration
         ay_smooth = np.convolve(ay, np.ones((Nay,)) / Nay, mode="same")
         return ay_smooth
 
@@ -372,9 +297,11 @@ class TelemetryExtractor:
     @memory.cache
     def calculate_z_acceleration(vx_array, x_array, z_array, dist_array, Naz):
         """Calculate and smooth Z-acceleration component using joblib caching."""
+        # Calculate gradients
         dx = np.gradient(x_array)
         dz = np.gradient(z_array)
 
+        # Calculate z_theta
         z_theta = np.arctan2(dz, (dx + np.finfo(float).eps))
         z_theta[0] = z_theta[1]
         z_theta_noDiscont = np.unwrap(z_theta)
@@ -387,12 +314,15 @@ class TelemetryExtractor:
             if abs(z_dtheta[i]) > 0.5:
                 z_dtheta[i] = z_dtheta[i - 1]
 
+        # Calculate z-curvature and vertical acceleration
         z_C = z_dtheta / (ds + 0.0001)
         az = np.square(vx_array) * z_C
 
+        # Remove extreme values
         indexProblems = np.abs(az) > 150
         az[indexProblems] = 0
 
+        # Smooth z-acceleration
         az_smooth = np.convolve(az, np.ones((Naz,)) / Naz, mode="same")
         return az_smooth
 
@@ -400,9 +330,11 @@ class TelemetryExtractor:
         self, telemetry: pd.DataFrame, Nax: int, Nay: int, Naz: int
     ) -> pd.DataFrame:
         """Calculate acceleration components from telemetry data with joblib parallelization."""
+        # Convert speed from km/h to m/s
         vx = telemetry["Speed"] / 3.6
         time_float = telemetry["Time"] / np.timedelta64(1, "s")
 
+        # Extract arrays for calculations
         vx_array = vx.values
         time_array = time_float.values
         x_array = telemetry["X"].values
@@ -410,7 +342,8 @@ class TelemetryExtractor:
         z_array = telemetry["Z"].values
         dist_array = telemetry["Distance"].values
 
-        if self.use_joblib and len(telemetry) > 100:
+        if self.use_joblib and len(telemetry) > 100:  # Use joblib for larger datasets
+            # Parallel calculation of all three acceleration components
             results = Parallel(n_jobs=min(3, self.n_jobs if self.n_jobs > 0 else 3), backend='threading')(
                 [
                     delayed(self.calculate_x_acceleration)(vx_array, time_array, Nax),
@@ -421,48 +354,102 @@ class TelemetryExtractor:
             
             ax_smooth, ay_smooth, az_smooth = results
         else:
+            # Fall back to original sequential calculation for small datasets
             ax_smooth = self.calculate_x_acceleration(vx_array, time_array, Nax)
             ay_smooth = self.calculate_y_acceleration(vx_array, x_array, y_array, dist_array, Nay)
             az_smooth = self.calculate_z_acceleration(vx_array, x_array, z_array, dist_array, Naz)
 
-        telemetry = telemetry.copy()
+        # Add acceleration columns to telemetry
+        telemetry = telemetry.copy()  # Ensure we don't modify the original
         telemetry["Ax"] = ax_smooth
         telemetry["Ay"] = ay_smooth
         telemetry["Az"] = az_smooth
 
         return telemetry
 
-    def process_single_lap_telemetry(self, telemetry: pd.DataFrame, data_key: str) -> TelemetryWrapper:
-        """Process telemetry for a single lap and return msgspec struct."""
+    @staticmethod
+    @memory.cache
+    def cached_telemetry_processing(
+        time_array, rpm_array, speed_array, gear_array, throttle_array,
+        brake_array, drs_array, distance_array, rel_distance_array,
+        x_array, y_array, z_array, ax_array, ay_array, az_array, data_key
+    ):
+        """Cache the final telemetry data structure to avoid recomputation."""
+        return {
+            "tel": {
+                "time": time_array.tolist() if hasattr(time_array, 'tolist') else time_array,
+                "rpm": rpm_array.tolist() if hasattr(rpm_array, 'tolist') else rpm_array,
+                "speed": speed_array.tolist() if hasattr(speed_array, 'tolist') else speed_array,
+                "gear": gear_array.tolist() if hasattr(gear_array, 'tolist') else gear_array,
+                "throttle": throttle_array.tolist() if hasattr(throttle_array, 'tolist') else throttle_array,
+                "brake": brake_array.tolist() if hasattr(brake_array, 'tolist') else brake_array,
+                "drs": drs_array.tolist() if hasattr(drs_array, 'tolist') else drs_array,
+                "distance": distance_array.tolist() if hasattr(distance_array, 'tolist') else distance_array,
+                "rel_distance": rel_distance_array.tolist() if hasattr(rel_distance_array, 'tolist') else rel_distance_array,
+                "acc_x": ax_array.tolist() if hasattr(ax_array, 'tolist') else ax_array,
+                "acc_y": ay_array.tolist() if hasattr(ay_array, 'tolist') else ay_array,
+                "acc_z": az_array.tolist() if hasattr(az_array, 'tolist') else az_array,
+                "x": x_array.tolist() if hasattr(x_array, 'tolist') else x_array,
+                "y": y_array.tolist() if hasattr(y_array, 'tolist') else y_array,
+                "z": z_array.tolist() if hasattr(z_array, 'tolist') else z_array,
+                "dataKey": data_key,
+            }
+        }
+
+    def process_single_lap_telemetry_direct(self, telemetry: pd.DataFrame, data_key: str) -> Dict:
+        """Process telemetry for a single lap directly without caching issues."""
+        # Calculate accelerations
         acc_tel = self.accCalc(telemetry, 3, 9, 9)
         acc_tel["Time"] = acc_tel["Time"].dt.total_seconds()
 
         # Convert DRS and Brake to binary values
-        acc_tel["DRS"] = acc_tel["DRS"].apply(lambda x: 1 if x in [10, 12, 14] else 0)
+        acc_tel["DRS"] = acc_tel["DRS"].apply(
+            lambda x: 1 if x in [10, 12, 14] else 0
+        )
         acc_tel["Brake"] = acc_tel["Brake"].apply(lambda x: 1 if x == True else 0)
 
-        # Convert numpy arrays to lists for msgspec
-        # Use native Python types for better msgspec performance
-        tel_data = TelemetryData(
-            time=[float(x) for x in acc_tel["Time"].values],
-            rpm=[int(x) for x in acc_tel["RPM"].values],
-            speed=[float(x) for x in acc_tel["Speed"].values],
-            gear=[int(x) for x in acc_tel["nGear"].values],
-            throttle=[int(x) for x in acc_tel["Throttle"].values],
-            brake=[int(x) for x in acc_tel["Brake"].values],
-            drs=[int(x) for x in acc_tel["DRS"].values],
-            distance=[float(x) for x in acc_tel["Distance"].values],
-            rel_distance=[float(x) for x in acc_tel["RelativeDistance"].values],
-            acc_x=[float(x) for x in acc_tel["Ax"].values],
-            acc_y=[float(x) for x in acc_tel["Ay"].values],
-            acc_z=[float(x) for x in acc_tel["Az"].values],
-            x=[float(x) for x in acc_tel["X"].values],
-            y=[float(x) for x in acc_tel["Y"].values],
-            z=[float(x) for x in acc_tel["Z"].values],
-            dataKey=data_key,
-        )
-
-        return TelemetryWrapper(tel=tel_data)
+        # Use cached telemetry processing if joblib is enabled
+        if self.use_joblib:
+            return self.cached_telemetry_processing(
+                acc_tel["Time"].values,
+                acc_tel["RPM"].values,
+                acc_tel["Speed"].values,
+                acc_tel["nGear"].values,
+                acc_tel["Throttle"].values,
+                acc_tel["Brake"].values,
+                acc_tel["DRS"].values,
+                acc_tel["Distance"].values,
+                acc_tel["RelativeDistance"].values,
+                acc_tel["X"].values,
+                acc_tel["Y"].values,
+                acc_tel["Z"].values,
+                acc_tel["Ax"].values,
+                acc_tel["Ay"].values,
+                acc_tel["Az"].values,
+                data_key
+            )
+        else:
+            # Non-cached version
+            return {
+                "tel": {
+                    "time": acc_tel["Time"].tolist(),
+                    "rpm": acc_tel["RPM"].tolist(),
+                    "speed": acc_tel["Speed"].tolist(),
+                    "gear": acc_tel["nGear"].tolist(),
+                    "throttle": acc_tel["Throttle"].tolist(),
+                    "brake": acc_tel["Brake"].tolist(),
+                    "drs": acc_tel["DRS"].tolist(),
+                    "distance": acc_tel["Distance"].tolist(),
+                    "rel_distance": acc_tel["RelativeDistance"].tolist(),
+                    "acc_x": acc_tel["Ax"].tolist(),
+                    "acc_y": acc_tel["Ay"].tolist(),
+                    "acc_z": acc_tel["Az"].tolist(),
+                    "x": acc_tel["X"].tolist(),
+                    "y": acc_tel["Y"].tolist(),
+                    "z": acc_tel["Z"].tolist(),
+                    "dataKey": data_key,
+                }
+            }
 
     def process_lap(
         self,
@@ -475,7 +462,7 @@ class TelemetryExtractor:
         driver_laps=None,
     ) -> bool:
         """Process a single lap for a driver."""        
-        file_path = f"{driver_dir}/{lap_number}_tel{self.ext}"
+        file_path = f"{driver_dir}/{lap_number}_tel.json"
 
         # Skip if file already exists
         if os.path.exists(file_path):
@@ -488,7 +475,12 @@ class TelemetryExtractor:
             if driver_laps is None:
                 laps = f1session.laps
                 driver_laps = laps.pick_drivers(driver).copy()
+                # Create a new column for lap times in seconds to avoid dtype conflicts
+                driver_laps["LapTimeSeconds"] = driver_laps["LapTime"].apply(
+                    lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
+                )
 
+            # Get the telemetry for lap_number
             selected_lap = driver_laps[driver_laps.LapNumber == lap_number]
 
             if selected_lap.empty:
@@ -499,13 +491,14 @@ class TelemetryExtractor:
 
             telemetry = selected_lap.get_telemetry()
             
+            # Create data key
             data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
             
-            # Process telemetry and get msgspec struct
-            telemetry_struct = self.process_single_lap_telemetry(telemetry, data_key)
+            # Process telemetry directly to avoid serialization issues
+            telemetry_data = self.process_single_lap_telemetry_direct(telemetry, data_key)
 
-            # Write using msgspec (much faster than JSON)
-            self.write_func(telemetry_struct, file_path)
+            with open(file_path, "w") as json_file:
+                json.dump(telemetry_data, json_file)
 
             return True
         except Exception as e:
@@ -522,15 +515,17 @@ class TelemetryExtractor:
             return self.process_lap(event, session, driver, lap_number, driver_dir, f1session)
 
         if self.use_joblib and len(lap_numbers) > 1:
+            # Use joblib for parallel processing of the batch
             results = Parallel(n_jobs=self.n_jobs, backend='loky', prefer='processes')(
                 delayed(process_single_lap_job)(lap_num) for lap_num in lap_numbers
             )
         else:
+            # Sequential processing for small batches
             results = [process_single_lap_job(lap_num) for lap_num in lap_numbers]
         
         return results
 
-    def get_circuit_info(self, event: str, session: str) -> Optional[CircuitInfo]:
+    def get_circuit_info(self, event: str, session: str) -> Optional[Dict[str, List]]:
         """Get circuit corner information."""
         cache_key = f"{self.year}-{event}-{session}"
 
@@ -541,34 +536,37 @@ class TelemetryExtractor:
             f1session = self.get_session(event, session)
             circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
+            # Try to get corner data from fastf1 first
             try:
                 circuit_info = f1session.get_circuit_info()
                 corners = circuit_info.corners
+                # Get the rotation from the circuit info
                 rotation = circuit_info.rotation
 
-                corner_struct = CircuitInfo(
-                    CornerNumber=corners["Number"].tolist(),
-                    X=corners["X"].tolist(),
-                    Y=corners["Y"].tolist(),
-                    Angle=corners["Angle"].tolist(),
-                    Distance=corners["Distance"].tolist(),
-                    Rotation=rotation,
-                )
-                CIRCUIT_INFO_CACHE[cache_key] = corner_struct
-                return corner_struct
+                corner_info = {
+                    "CornerNumber": corners["Number"].tolist(),
+                    "X": corners["X"].tolist(),
+                    "Y": corners["Y"].tolist(),
+                    "Angle": corners["Angle"].tolist(),
+                    "Distance": corners["Distance"].tolist(),
+                    "Rotation": rotation,  # Add rotation information
+                }
+                CIRCUIT_INFO_CACHE[cache_key] = corner_info
+                return corner_info
             except (AttributeError, KeyError):
+                # Fall back to API method if fastf1 method fails
                 circuit_info, rotation = self._get_circuit_info_from_api(circuit_key)
                 if circuit_info is not None:
-                    corner_struct = CircuitInfo(
-                        CornerNumber=circuit_info["Number"].tolist(),
-                        X=circuit_info["X"].tolist(),
-                        Y=circuit_info["Y"].tolist(),
-                        Angle=circuit_info["Angle"].tolist(),
-                        Distance=(circuit_info["Distance"] / 10).tolist(),
-                        Rotation=rotation,
-                    )
-                    CIRCUIT_INFO_CACHE[cache_key] = corner_struct
-                    return corner_struct
+                    corner_info = {
+                        "CornerNumber": circuit_info["Number"].tolist(),
+                        "X": circuit_info["X"].tolist(),
+                        "Y": circuit_info["Y"].tolist(),
+                        "Angle": circuit_info["Angle"].tolist(),
+                        "Distance": (circuit_info["Distance"] / 10).tolist(),
+                        "Rotation": rotation,  # Add rotation information from API
+                    }
+                    CIRCUIT_INFO_CACHE[cache_key] = corner_info
+                    return corner_info
 
             logger.warning(f"Could not get corner data for {event} {session}")
             return None
@@ -588,6 +586,7 @@ class TelemetryExtractor:
                 return None, 0.0
 
             data = response.json()
+            # Extract rotation from the API response
             rotation = float(data.get("rotation", 0.0))
 
             rows = []
@@ -624,23 +623,35 @@ class TelemetryExtractor:
             if f1session is None:
                 f1session = self.get_session(event, session, load_telemetry=True)
 
-            # Save lap times using msgspec (already returns a LapData struct)
+            # Save lap times
             laptimes = self.laps_data(event, session, driver, f1session)
-            # No need to process - laps_data already handles NaN conversion
-            self.write_func(laptimes, f"{driver_dir}/laptimes{self.ext}")
+            # Replace NaN values with None before JSON serialization
+            laptimes["time"] = ["None" if pd.isna(x) else x for x in laptimes["time"]]
+            laptimes["lap"] = ["None" if pd.isna(x) else x for x in laptimes["lap"]]
+            laptimes["compound"] = [
+                "None" if pd.isna(x) else x for x in laptimes["compound"]
+            ]
+            with open(f"{driver_dir}/laptimes.json", "w") as json_file:
+                json.dump(laptimes, json_file)
 
             # Get driver laps
             laps = f1session.laps
             driver_laps = laps.pick_drivers(driver).copy()
             driver_laps["LapNumber"] = driver_laps["LapNumber"].astype(int)
+            # Create a new column for lap times in seconds to avoid dtype conflicts
+            driver_laps["LapTimeSeconds"] = driver_laps["LapTime"].apply(
+                lambda x: x.total_seconds() if hasattr(x, "total_seconds") else x
+            )
             lap_numbers = driver_laps["LapNumber"].tolist()
 
             if self.use_joblib and len(lap_numbers) > self.batch_size:
+                # Split laps into batches for joblib processing
                 lap_batches = [
                     lap_numbers[i:i + self.batch_size] 
                     for i in range(0, len(lap_numbers), self.batch_size)
                 ]
                 
+                # Process batches with ThreadPoolExecutor for I/O coordination
                 with ThreadPoolExecutor(max_workers=min(4, len(lap_batches))) as executor:
                     futures = [
                         executor.submit(
@@ -651,8 +662,9 @@ class TelemetryExtractor:
                     ]
                     
                     for future in as_completed(futures):
-                        future.result()
+                        future.result()  # Catch any exceptions
             else:
+                # Use original parallel processing for smaller datasets
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     futures = [
                         executor.submit(
@@ -669,30 +681,35 @@ class TelemetryExtractor:
                     ]
 
                     for future in as_completed(futures):
-                        future.result()
+                        future.result()  # Just to catch any exceptions
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {str(e)}")
 
     def process_event_session(self, event: str, session: str) -> None:
         """Process a single event and session, extracting all telemetry data."""
-        logger.info(f"Processing {event} - {session} with msgspec ({self.ext[1:]} format)")
+        logger.info(f"Processing {event} - {session} {'with joblib' if self.use_joblib else 'without joblib'}")
 
+        # Create base directory for this event/session
         base_dir = f"{event}/{session}"
         os.makedirs(base_dir, exist_ok=True)
 
         try:
+            # Load session data once
             f1session = self.get_session(event, session, load_telemetry=True)
 
-            # Save drivers information using msgspec
+            # Save drivers information
             drivers_info = self.session_drivers(event, session)
-            self.write_func(drivers_info, f"{base_dir}/drivers{self.ext}")
+            with open(f"{base_dir}/drivers.json", "w") as json_file:
+                json.dump(drivers_info, json_file)
 
-            # Save circuit corner information using msgspec
+            # Save circuit corner information
             corner_info = self.get_circuit_info(event, session)
             if corner_info:
-                self.write_func(corner_info, f"{base_dir}/corners{self.ext}")
+                with open(f"{base_dir}/corners.json", "w") as json_file:
+                    json.dump(corner_info, json_file)
 
+            # Get driver list
             drivers = self.session_drivers_list(event, session)
 
             # Process drivers in parallel
@@ -705,15 +722,14 @@ class TelemetryExtractor:
                 ]
 
                 for future in as_completed(futures):
-                    future.result()
+                    future.result()  # Just to catch any exceptions
 
         except Exception as e:
             logger.error(f"Error processing {event} - {session}: {str(e)}")
 
     def process_all_data(self, max_workers: int = 4) -> None:
         """Process all configured events and sessions, with parallelization."""
-        logger.info(f"Starting msgspec-optimized telemetry extraction for {self.year} season")
-        logger.info(f"Format: {'MessagePack (binary)' if self.use_msgpack else 'JSON'}")
+        logger.info(f"Starting {'joblib-optimized' if self.use_joblib else 'standard'} telemetry extraction for {self.year} season")
         logger.info(f"Events: {self.events}")
         logger.info(f"Sessions: {self.sessions}")
         
@@ -722,6 +738,7 @@ class TelemetryExtractor:
 
         start_time = time.time()
 
+        # Process each event and session in parallel
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for event in self.events:
@@ -730,6 +747,7 @@ class TelemetryExtractor:
                         executor.submit(self.process_event_session, event, session)
                     )
 
+            # Wait for all tasks to complete
             for future in as_completed(futures):
                 try:
                     future.result()
@@ -746,15 +764,25 @@ class TelemetryExtractor:
             logger.info("Joblib cache cleared")
 
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
 import gc
+import logging
+import os
+
 import psutil
 
+logger = logging.getLogger("memory_monitor")
+
+
 def check_memory_usage(threshold_percent=80):
-    """Check if memory usage exceeds threshold and clear caches if needed."""
+    """
+    Check if memory usage exceeds threshold and clear caches if needed.
+
+    Args:
+        threshold_percent: Memory usage percentage threshold
+
+    Returns:
+        True if memory was cleared, False otherwise
+    """
     process = psutil.Process(os.getpid())
     memory_info = process.memory_info()
     memory_percent = process.memory_percent()
@@ -767,15 +795,19 @@ def check_memory_usage(threshold_percent=80):
         logger.warning(
             f"Memory usage exceeds {threshold_percent}% threshold, clearing caches"
         )
+        # Clear the session cache
         SESSION_CACHE.clear()
         CIRCUIT_INFO_CACHE.clear()
 
+        # Clear joblib cache
         if hasattr(memory, 'clear'):
             memory.clear()
             logger.info("Joblib cache cleared")
 
+        # Force garbage collection
         gc.collect()
 
+        # Log new memory usage
         new_memory_percent = psutil.Process(os.getpid()).memory_percent()
         logger.info(
             f"New memory usage after clearing caches: {new_memory_percent:.2f}%"
@@ -786,8 +818,19 @@ def check_memory_usage(threshold_percent=80):
 
 
 def is_data_available(year, events, sessions):
-    """Check if data is available for the specified year, events, and sessions."""
+    """
+    Check if data is available for the specified year, events, and sessions.
+
+    Args:
+        year: The F1 season year
+        events: List of event names to check
+        sessions: List of session names to check
+
+    Returns:
+        bool: True if data is available, False otherwise
+    """
     try:
+        # Try to load the first event and session as a test
         if not events or not sessions:
             logger.warning("No events or sessions specified to check")
             return False
@@ -797,13 +840,16 @@ def is_data_available(year, events, sessions):
 
         logger.info(f"Checking data availability for {year} {event} {session}...")
 
+        # Try to get the session without loading telemetry
         f1session = fastf1.get_session(year, event, session)
         f1session.load(telemetry=False, weather=False, messages=False)
 
+        # Check if we have lap data
         if f1session.laps.empty:
             logger.info(f"No lap data available yet for {year} {event} {session}")
             return False
 
+        # Check if we have at least one driver
         if len(f1session.laps["Driver"].unique()) == 0:
             logger.info(f"No driver data available yet for {year} {event} {session}")
             return False
@@ -817,20 +863,18 @@ def is_data_available(year, events, sessions):
 
 
 def main():
-    """Main entry point for the script with msgspec optimization."""
+    """Main entry point for the script with joblib optimization options."""
     try:
-        # Configuration options
+        # Configuration options for joblib
         use_joblib = True  # Set to False to disable joblib optimizations
-        n_jobs = -1  # -1 uses all available cores
+        n_jobs = -1  # -1 uses all available cores, or specify a number
         batch_size = 8  # Number of laps per batch for joblib processing
-        use_msgpack = True  # True for binary MessagePack, False for JSON
         
-        # Create extractor with msgspec + joblib options
+        # Create extractor with joblib options
         extractor = TelemetryExtractor(
             use_joblib=use_joblib,
             n_jobs=n_jobs,
-            batch_size=batch_size,
-            use_msgpack=use_msgpack,
+            batch_size=batch_size
         )
 
         # Use more workers on GitHub Actions
@@ -839,7 +883,7 @@ def main():
 
         # Wait for data to be available
         wait_time = 30  # seconds between checks
-        max_attempts = 720  # 12 hours max wait time
+        max_attempts = 720  # 12 hours max wait time (720 * 60 seconds)
         attempt = 0
 
         logger.info(f"Starting to wait for {extractor.year} season data...")
@@ -858,6 +902,7 @@ def main():
                 )
                 time.sleep(wait_time)
 
+                # Check memory usage and clear if needed
                 check_memory_usage()
 
         if attempt >= max_attempts:
