@@ -1,13 +1,13 @@
 """
-Pre-Season Testing Telemetry Extraction Script
-================================================
-Extracts telemetry data from F1 pre-season testing sessions.
+Season Session Telemetry Extraction Script
+==========================================
+Extracts telemetry data from non-testing F1 season sessions.
 
-Key differences from main_optimized.py (race weekends):
-- Uses fastf1.get_testing_session(year, test_number, session_number)
-- Uses fastf1.get_event_schedule(year, include_testing=True)
-- Output directory:  {year}/Pre-Season Testing/Test {N}/Day {M}/
-- Standalone: Use "cache_preseason" to avoid conflicts with main script
+Output directory:
+{year}/{event_name}/{session_name}/
+
+Standalone cache:
+cache_session
 """
 
 import gc
@@ -24,35 +24,69 @@ import psutil
 import requests
 
 # ---------------------------------------------------------------------------
-# Monkeypatch: Fix FastF1 2026 Pre-Season Path (Day N vs Practice N)
-# ---------------------------------------------------------------------------
-import fastf1._api
-_original_make_path = fastf1._api.make_path
-
-def _patched_make_path(wname, wdate, sname, sdate):
-    path = _original_make_path(wname, wdate, sname, sdate)
-    if "2026" in wdate:
-        if "Practice_1" in path:
-            path = path.replace("Practice_1", "Day_1")
-        elif "Practice_2" in path:
-            path = path.replace("Practice_2", "Day_2")
-        elif "Practice_3" in path:
-            path = path.replace("Practice_3", "Day_3")
-    return path
-
-fastf1._api.make_path = _patched_make_path
-
-# ---------------------------------------------------------------------------
 # Constants & Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_YEAR = 2026
-# Set these to an integer (e.g. 1) to filter, or None to process all
-TARGET_TEST_NUMBER = 1      # e.g. 1 for "Test 1"
-TARGET_SESSION_NUMBER = 1   # e.g. 1 for "Practice 1"
-
-# Deprecated but kept for compatibility if needed (though now unused by logic)
-SESSION_NUMBER = 1
+DEFAULT_YEAR = 2025
+# Keep exactly one uncommented event in this list.
+TARGET_EVENT_NAME = [
+    # "Pre-Season Testing",
+    # "Australian Grand Prix",
+    # "Chinese Grand Prix",
+    # "Japanese Grand Prix",
+    # "Bahrain Grand Prix",
+    # "Saudi Arabian Grand Prix",
+    # "Miami Grand Prix",
+    # "Emilia Romagna Grand Prix",
+    # "Monaco Grand Prix",
+    # "Spanish Grand Prix",
+    # "Canadian Grand Prix",
+    # "Austrian Grand Prix",
+    # "British Grand Prix",
+    # "Belgian Grand Prix",
+    # "Hungarian Grand Prix",
+    # "Dutch Grand Prix",
+    # "Italian Grand Prix",
+    # "Azerbaijan Grand Prix",
+    # "Singapore Grand Prix",
+    # "United States Grand Prix",
+    # "Mexico City Grand Prix",
+    # "São Paulo Grand Prix",
+    # "Las Vegas Grand Prix",
+    # "Qatar Grand Prix",
+    "Abu Dhabi Grand Prix",
+]
+if len(TARGET_EVENT_NAME) != 1:
+    raise ValueError(
+        "Set exactly one active event in TARGET_EVENT_NAME "
+        "(comment all others)."
+    )
+TARGET_EVENT_NAME = TARGET_EVENT_NAME[0]
+AVAILABLE_SESSIONS = [
+    "Practice 1",
+    "Practice 2",
+    "Practice 3",
+    "Qualifying",
+    "Sprint Qualifying",
+    "Sprint",
+    "Race",
+]
+# Select one or more sessions from AVAILABLE_SESSIONS.
+TARGET_SESSIONS = [
+    # "Practice 1",
+    # "Practice 2",
+    # "Practice 3",
+    # "Qualifying",
+    # "Sprint Qualifying",
+    # "Sprint",
+    "Race",
+]
+invalid_target_sessions = sorted(set(TARGET_SESSIONS) - set(AVAILABLE_SESSIONS))
+if invalid_target_sessions:
+    raise ValueError(
+        "Invalid TARGET_SESSIONS value(s): "
+        + ", ".join(invalid_target_sessions)
+    )
 PROTO = "https"
 HOST = "api.multiviewer.app"
 HEADERS = {"User-Agent": "FastF1/"}
@@ -70,19 +104,33 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("preseason_extraction.log"),
+        logging.FileHandler("session_extraction.log"),
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger("preseason_extractor")
+logger = logging.getLogger("session_extractor")
 logging.getLogger("fastf1").setLevel(logging.WARNING)
 logging.getLogger("fastf1").propagate = False
+
+_MISSING_TEXT_VALUES = {
+    "",
+    "null",
+    "nan",
+    "nat",
+    "none",
+    "inf",
+    "-inf",
+    "infinity",
+    "-infinity",
+}
 
 
 # ---------------------------------------------------------------------------
 # Helper Functions (Copied from main_optimized.py for standalone execution)
 # ---------------------------------------------------------------------------
-def _write_json(path: str, obj) -> None:
+def _write_json(path: str, obj, normalize_missing: bool = False) -> None:
+    if normalize_missing:
+        obj = _normalize_missing_for_json(obj)
     with open(path, "wb") as f:
         f.write(orjson.dumps(obj, option=ORJSON_OPTS))
 
@@ -109,7 +157,11 @@ def _col_to_list_str_or_none(col) -> list:
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
     out[mask] = "None"
-    out[~mask] = vals[~mask].astype(str)
+    valid_vals = vals[~mask]
+    s_vals = np.array([str(v).strip().lower() for v in valid_vals])
+    missing_mask = np.isin(s_vals, list(_MISSING_TEXT_VALUES))
+    str_vals = np.array([str(v) for v in valid_vals])
+    out[~mask] = np.where(missing_mask, "None", str_vals)
     return out.tolist()
 
 
@@ -133,6 +185,154 @@ def _col_to_list_bool_or_none(series: pd.Series) -> list:
     out[mask] = "None"
     out[~mask] = vals[~mask].astype(bool)
     return out.tolist()
+
+
+def _series_to_json_list(series: pd.Series) -> list:
+    if series.empty:
+        return []
+
+    if pd.api.types.is_timedelta64_dtype(series.dtype):
+        return _td_col_to_seconds(series)
+
+    vals = series.to_numpy()
+    if pd.api.types.is_float_dtype(series.dtype):
+        vals_f = vals.astype(np.float64, copy=False)
+        mask = ~np.isfinite(vals_f)
+    else:
+        mask = pd.isna(vals)
+    out = np.empty(vals.shape, dtype=object)
+    out[mask] = "None"
+
+    valid = ~mask
+    if not valid.any():
+        return out.tolist()
+
+    if pd.api.types.is_bool_dtype(series.dtype):
+        out[valid] = vals[valid].astype(bool)
+    elif pd.api.types.is_integer_dtype(series.dtype):
+        out[valid] = vals[valid].astype(int)
+    elif pd.api.types.is_float_dtype(series.dtype):
+        out[valid] = vals[valid].astype(float)
+    else:
+        valid_vals = vals[valid]
+        s_vals = np.array([str(v).strip().lower() for v in valid_vals])
+        missing_mask = np.isin(s_vals, list(_MISSING_TEXT_VALUES))
+        str_vals = np.array([str(v) for v in valid_vals])
+        out[valid] = np.where(missing_mask, "None", str_vals)
+
+    return out.tolist()
+
+
+def _scalar_to_json_primitive_or_none(value):
+    if isinstance(value, (float, np.floating)):
+        return "None" if not np.isfinite(value) else float(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, str):
+        return "None" if value.strip().lower() in _MISSING_TEXT_VALUES else value
+    if pd.isna(value):
+        return "None"
+    return value
+
+
+def _normalize_missing_for_json(value):
+    if isinstance(value, dict):
+        return {k: _normalize_missing_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_missing_for_json(v) for v in value]
+    if isinstance(value, tuple):
+        return [_normalize_missing_for_json(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_normalize_missing_for_json(v) for v in value.tolist()]
+    return _scalar_to_json_primitive_or_none(value)
+
+
+def _dataframe_to_column_lists(df: pd.DataFrame) -> Dict[str, list]:
+    if df is None or df.empty:
+        return {}
+    return {col: _series_to_json_list(df[col]) for col in df.columns}
+
+
+_LAP_WEATHER_COL_MAP = (
+    ("wT", "Time"),
+    ("wAT", "AirTemp"),
+    ("wH", "Humidity"),
+    ("wP", "Pressure"),
+    ("wR", "Rainfall"),
+    ("wTT", "TrackTemp"),
+    ("wWD", "WindDirection"),
+    ("wWS", "WindSpeed"),
+)
+LAP_WEATHER_KEYS = tuple(k for k, _ in _LAP_WEATHER_COL_MAP)
+
+_RCM_COL_MAP = (
+    ("time", "Time"),
+    ("cat", "Category"),
+    ("msg", "Message"),
+    ("status", "Status"),
+    ("flag", "Flag"),
+    ("scope", "Scope"),
+    ("sector", "Sector"),
+    ("dNum", "RacingNumber"),
+    ("lap", "Lap"),
+)
+
+
+def _session_weather_to_column_lists(weather_df: pd.DataFrame) -> Dict[str, list]:
+    if weather_df is None or weather_df.empty:
+        return {}
+
+    out: Dict[str, list] = {}
+    for short_key, weather_col in _LAP_WEATHER_COL_MAP:
+        if weather_col in weather_df.columns:
+            out[short_key] = _series_to_json_list(weather_df[weather_col])
+    return out
+
+
+def _session_rcm_to_column_lists(rcm_df: pd.DataFrame) -> Dict[str, list]:
+    if rcm_df is None or rcm_df.empty:
+        return {}
+
+    out: Dict[str, list] = {}
+    for short_key, rcm_col in _RCM_COL_MAP:
+        if rcm_col in rcm_df.columns:
+            out[short_key] = _series_to_json_list(rcm_df[rcm_col])
+    return out
+
+
+def _lap_weather_to_column_lists(laps: pd.DataFrame, weather_df: pd.DataFrame = None) -> Dict[str, list]:
+    n_laps = len(laps)
+    if n_laps == 0:
+        return {k: [] for k in LAP_WEATHER_KEYS}
+
+    none_row = ["None"] * n_laps
+    out = {k: none_row.copy() for k in LAP_WEATHER_KEYS}
+
+    if weather_df is None:
+        if not hasattr(laps, "get_weather_data"):
+            return out
+        try:
+            weather_df = laps.get_weather_data()
+        except Exception:
+            return out
+
+    if weather_df is None:
+        return out
+
+    for short_key, weather_col in _LAP_WEATHER_COL_MAP:
+        if weather_col not in weather_df.columns:
+            continue
+
+        values = _series_to_json_list(weather_df[weather_col])
+        if len(values) < n_laps:
+            values.extend(["None"] * (n_laps - len(values)))
+        elif len(values) > n_laps:
+            values = values[:n_laps]
+        out[short_key] = values
+
+    return out
 
 
 def _array_to_list_float_or_none(arr: np.ndarray) -> list:
@@ -308,60 +508,72 @@ def check_memory_usage(threshold_percent=80, session_cache=None, circuit_cache=N
 
 
 # ---------------------------------------------------------------------------
-# Pre-Season Extractor
+# Season Session Extractor
 # ---------------------------------------------------------------------------
-class PreSeasonExtractor:
-    """Extract telemetry from pre-season testing sessions."""
+class SeasonSessionExtractor:
+    """Extract telemetry from non-testing season sessions."""
 
     def __init__(self, year: int = DEFAULT_YEAR):
         self.year = year
         self._session_cache: Dict[str, fastf1.core.Session] = {}
         self._circuit_cache: Dict[str, dict] = {}
 
-    def discover_testing_events(self) -> List[dict]:
-        """Return list of testing events with their test_number and session count.
-        Forces backend='fastf1' to avoid 'Day 1' session naming issues.
-        """
-        try:
-            schedule = fastf1.get_event_schedule(
-                self.year, include_testing=True, backend="fastf1"
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to load schedule with backend='fastf1': {e}. "
-                "Retrying with default backend..."
-            )
-            schedule = fastf1.get_event_schedule(self.year, include_testing=True)
-
-        testing = schedule[schedule["EventFormat"] == "testing"]
+    def discover_events(self) -> List[dict]:
+        """Return non-testing events with round number and available sessions."""
+        schedule = fastf1.get_event_schedule(self.year, include_testing=False)
+        if "EventFormat" in schedule.columns:
+            schedule = schedule[schedule["EventFormat"] != "testing"]
 
         events = []
-        for idx, (_, row) in enumerate(testing.iterrows(), start=1):
-            n_sessions = 0
+        for _, row in schedule.iterrows():
+            round_raw = row.get("RoundNumber")
+            if pd.isna(round_raw):
+                continue
+
+            try:
+                round_number = int(round_raw)
+            except (TypeError, ValueError):
+                continue
+
+            event_name = str(row.get("EventName", f"Round {round_number}")).strip()
+            sessions = []
+
             for s in range(1, 6):
                 col = f"Session{s}"
-                if col in row.index:
-                    val = row[col]
-                    if pd.notna(val) and str(val).strip() not in ("", "None"):
-                        n_sessions += 1
-            events.append({
-                "test_number": idx,
-                "event_name": row.get("EventName", f"Test {idx}"),
-                "sessions": max(n_sessions, 1),
-            })
+                if col not in row.index:
+                    continue
+                val = row[col]
+                if pd.isna(val):
+                    continue
+                session_name = str(val).strip()
+                if session_name and session_name not in ("None", "nan"):
+                    sessions.append(session_name)
 
-        logger.info(f"Discovered {len(events)} testing event(s) for {self.year}")
+            if not sessions:
+                sessions = ["Race"]
+
+            events.append(
+                {
+                    "round_number": round_number,
+                    "event_name": event_name,
+                    "sessions": sessions,
+                }
+            )
+
+        events.sort(key=lambda e: e["round_number"])
+
+        logger.info(f"Discovered {len(events)} season event(s) for {self.year}")
         for e in events:
             logger.info(
-                f"  Test {e['test_number']}: {e['event_name']} "
-                f"({e['sessions']} sessions)"
+                f"  Round {e['round_number']}: {e['event_name']} "
+                f"({', '.join(e['sessions'])})"
             )
         return events
 
     def get_session(
-        self, test_number: int, session_number: int, load_telemetry: bool = False
+        self, round_number: int, session_name: str, load_telemetry: bool = False
     ) -> fastf1.core.Session:
-        cache_key = f"{self.year}-T{test_number}-S{session_number}"
+        cache_key = f"{self.year}-R{round_number}-{session_name}"
         cached = self._session_cache.get(cache_key)
 
         if cached is not None:
@@ -371,46 +583,119 @@ class PreSeasonExtractor:
                 self._session_cache[cache_key] = cached
             return cached
 
-        # Enforce 'fastf1' backend to ensure correct session naming ("Practice N")
-        f1session = fastf1.get_testing_session(
-            self.year, test_number, session_number, backend="fastf1"
-        )
+        f1session = fastf1.get_session(self.year, round_number, session_name)
         f1session.load(telemetry=load_telemetry, weather=True, messages=True)
         f1session._telemetry_loaded = load_telemetry
         self._session_cache[cache_key] = f1session
         return f1session
 
     def session_drivers(
-        self, test_number: int, session_number: int
+        self, round_number: int, session_name: str
     ) -> Dict[str, List[Dict[str, str]]]:
         try:
-            f1session = self.get_session(test_number, session_number)
+            f1session = self.get_session(round_number, session_name)
             laps = f1session.laps
-            driver_team = laps.drop_duplicates(subset="Driver")[["Driver", "Team"]]
+            driver_cols = ["Driver", "Team"]
+            has_driver_number = "DriverNumber" in laps.columns
+            if has_driver_number:
+                driver_cols.append("DriverNumber")
+            driver_team = laps.drop_duplicates(subset="Driver")[driver_cols]
+
+            results = f1session.results
+            result_by_abbr = {}
+            result_by_number = {}
+            if results is not None and not results.empty:
+                for row in results.itertuples():
+                    abbr = getattr(row, "Abbreviation", None)
+                    if pd.notna(abbr):
+                        result_by_abbr[str(abbr)] = row
+
+                    driver_number = getattr(row, "DriverNumber", None)
+                    if pd.notna(driver_number):
+                        result_by_number[str(driver_number)] = row
+
             drivers = [
-                {"driver": row.Driver, "team": row.Team}
+                self._build_driver_info(
+                    row=row,
+                    has_driver_number=has_driver_number,
+                    result_by_abbr=result_by_abbr,
+                    result_by_number=result_by_number,
+                )
                 for row in driver_team.itertuples(index=False)
             ]
             return {"drivers": drivers}
         except Exception as e:
             logger.error(
-                f"Error getting drivers for Test {test_number} Session {session_number}: {e}"
+                f"Error getting drivers for Round {round_number} {session_name}: {e}"
             )
             return {"drivers": []}
+
+    def _build_driver_info(
+        self,
+        row,
+        has_driver_number: bool,
+        result_by_abbr: Dict[str, object],
+        result_by_number: Dict[str, object],
+    ) -> Dict[str, str]:
+        driver = _scalar_to_json_primitive_or_none(row.Driver)
+        team = _scalar_to_json_primitive_or_none(row.Team)
+        driver_number = _scalar_to_json_primitive_or_none(
+            row.DriverNumber if has_driver_number else "None"
+        )
+
+        result_row = result_by_abbr.get(str(driver))
+        if result_row is None and driver_number != "None":
+            result_row = result_by_number.get(str(driver_number))
+
+        first_name = "None"
+        last_name = "None"
+        team_color = "None"
+        headshot_url = "None"
+
+        if result_row is not None:
+            first_name = _scalar_to_json_primitive_or_none(
+                getattr(result_row, "FirstName", "None")
+            )
+            last_name = _scalar_to_json_primitive_or_none(
+                getattr(result_row, "LastName", "None")
+            )
+            team_color = _scalar_to_json_primitive_or_none(
+                getattr(result_row, "TeamColor", "None")
+            )
+            headshot_url = _scalar_to_json_primitive_or_none(
+                getattr(
+                    result_row,
+                    "HeadshotUrl",
+                    getattr(result_row, "HeadShotUrl", "None"),
+                )
+            )
+
+        return {
+            "driver": driver,
+            "team": team,
+            "dn": driver_number,
+            "fn": first_name,
+            "ln": last_name,
+            "tc": team_color,
+            "url": headshot_url,
+        }
 
     def laps_data(
         self,
         driver: str,
         f1session: fastf1.core.Session,
         driver_laps: pd.DataFrame = None,
+        session_weather_df: pd.DataFrame = None,
     ) -> Dict[str, list]:
         try:
             if driver_laps is None:
                 driver_laps = f1session.laps.pick_drivers(driver)
 
+            lap_weather = _lap_weather_to_column_lists(driver_laps, session_weather_df)
+
             return {
                 "time": _td_col_to_seconds(driver_laps["LapTime"]),
-                "lap": driver_laps["LapNumber"].tolist(),
+                "lap": _col_to_list_int_or_none(driver_laps["LapNumber"]),
                 "compound": _col_to_list_str_or_none(driver_laps["Compound"]),
                 "stint": _col_to_list_int_or_none(driver_laps["Stint"]),
                 "s1": _td_col_to_seconds(driver_laps["Sector1Time"]),
@@ -420,6 +705,27 @@ class PreSeasonExtractor:
                 "pos": _col_to_list_int_or_none(driver_laps["Position"]),
                 "status": _col_to_list_str_or_none(driver_laps["TrackStatus"]),
                 "pb": _col_to_list_bool_or_none(driver_laps["IsPersonalBest"]),
+                "sesT": _td_col_to_seconds(driver_laps["Time"]),
+                "drv": _col_to_list_str_or_none(driver_laps["Driver"]),
+                "dNum": _col_to_list_str_or_none(driver_laps["DriverNumber"]),
+                "pout": _td_col_to_seconds(driver_laps["PitOutTime"]),
+                "pin": _td_col_to_seconds(driver_laps["PitInTime"]),
+                "s1T": _td_col_to_seconds(driver_laps["Sector1SessionTime"]),
+                "s2T": _td_col_to_seconds(driver_laps["Sector2SessionTime"]),
+                "s3T": _td_col_to_seconds(driver_laps["Sector3SessionTime"]),
+                "vi1": _array_to_list_float_or_none(driver_laps["SpeedI1"].to_numpy()),
+                "vi2": _array_to_list_float_or_none(driver_laps["SpeedI2"].to_numpy()),
+                "vfl": _array_to_list_float_or_none(driver_laps["SpeedFL"].to_numpy()),
+                "vst": _array_to_list_float_or_none(driver_laps["SpeedST"].to_numpy()),
+                "fresh": _col_to_list_bool_or_none(driver_laps["FreshTyre"]),
+                "team": _col_to_list_str_or_none(driver_laps["Team"]),
+                "lST": _td_col_to_seconds(driver_laps["LapStartTime"]),
+                "lSD": _col_to_list_str_or_none(driver_laps["LapStartDate"]),
+                "del": _col_to_list_bool_or_none(driver_laps["Deleted"]),
+                "delR": _col_to_list_str_or_none(driver_laps["DeletedReason"]),
+                "ff1G": _col_to_list_bool_or_none(driver_laps["FastF1Generated"]),
+                "iacc": _col_to_list_bool_or_none(driver_laps["IsAccurate"]),
+                **lap_weather,
             }
         except Exception as e:
             logger.error(f"Error getting lap data for {driver}: {e}")
@@ -428,30 +734,35 @@ class PreSeasonExtractor:
                 for k in (
                     "time", "lap", "compound", "stint",
                     "s1", "s2", "s3", "life", "pos", "status", "pb",
+                    "sesT", "drv", "dNum", "pout", "pin",
+                    "s1T", "s2T", "s3T", "vi1", "vi2",
+                    "vfl", "vst", "fresh", "team", "lST",
+                    "lSD", "del", "delR", "ff1G", "iacc",
+                    *LAP_WEATHER_KEYS,
                 )
             }
 
     def get_circuit_info(
-        self, test_number: int, session_number: int
+        self, round_number: int, session_name: str
     ) -> Optional[Dict]:
-        cache_key = f"{self.year}-T{test_number}-S{session_number}"
+        cache_key = f"{self.year}-R{round_number}-{session_name}"
         if cache_key in self._circuit_cache:
             return self._circuit_cache[cache_key]
 
         try:
-            f1session = self.get_session(test_number, session_number)
+            f1session = self.get_session(round_number, session_name)
             circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
             try:
                 circuit_info = f1session.get_circuit_info()
                 corners = circuit_info.corners
                 result = {
-                    "CornerNumber": corners["Number"].tolist(),
-                    "X": corners["X"].tolist(),
-                    "Y": corners["Y"].tolist(),
-                    "Angle": corners["Angle"].tolist(),
-                    "Distance": corners["Distance"].tolist(),
-                    "Rotation": circuit_info.rotation,
+                    "CornerNumber": _series_to_json_list(corners["Number"]),
+                    "X": _series_to_json_list(corners["X"]),
+                    "Y": _series_to_json_list(corners["Y"]),
+                    "Angle": _series_to_json_list(corners["Angle"]),
+                    "Distance": _series_to_json_list(corners["Distance"]),
+                    "Rotation": _scalar_to_json_primitive_or_none(circuit_info.rotation),
                 }
                 self._circuit_cache[cache_key] = result
                 return result
@@ -459,23 +770,23 @@ class PreSeasonExtractor:
                 circuit_df, rotation = self._get_circuit_info_from_api(circuit_key)
                 if circuit_df is not None:
                     result = {
-                        "CornerNumber": circuit_df["Number"].tolist(),
-                        "X": circuit_df["X"].tolist(),
-                        "Y": circuit_df["Y"].tolist(),
-                        "Angle": circuit_df["Angle"].tolist(),
-                        "Distance": (circuit_df["Distance"] / 10).tolist(),
-                        "Rotation": rotation,
+                        "CornerNumber": _series_to_json_list(circuit_df["Number"]),
+                        "X": _series_to_json_list(circuit_df["X"]),
+                        "Y": _series_to_json_list(circuit_df["Y"]),
+                        "Angle": _series_to_json_list(circuit_df["Angle"]),
+                        "Distance": _series_to_json_list(circuit_df["Distance"] / 10),
+                        "Rotation": _scalar_to_json_primitive_or_none(rotation),
                     }
                     self._circuit_cache[cache_key] = result
                     return result
 
             logger.warning(
-                f"Could not get corner data for Test {test_number} Session {session_number}"
+                f"Could not get corner data for Round {round_number} {session_name}"
             )
             return None
         except Exception as e:
             logger.error(
-                f"Error getting circuit info for Test {test_number} Session {session_number}: {e}"
+                f"Error getting circuit info for Round {round_number} {session_name}: {e}"
             )
             return None
 
@@ -520,23 +831,20 @@ class PreSeasonExtractor:
         lap_number: int,
         driver_dir: str,
         driver_laps: pd.DataFrame,
-        test_number: int,
-        session_number: int,
+        event_name: str,
+        session_name: str,
     ) -> bool:
         file_path = f"{driver_dir}/{lap_number}_tel.json"
         try:
             selected = driver_laps[driver_laps.LapNumber == lap_number]
             if selected.empty:
                 logger.warning(
-                    f"No data for {driver} lap {lap_number} "
-                    f"in Test {test_number} Session {session_number}"
+                    f"No data for {driver} lap {lap_number} in {event_name} {session_name}"
                 )
                 return False
 
             telemetry = selected.get_telemetry()
-            data_key = (
-                f"{self.year}-PreSeasonTesting-Practice {session_number}-{driver}-{lap_number}"
-            )
+            data_key = f"{self.year}-{event_name}-{session_name}-{driver}-{lap_number}"
             tel_data = _process_telemetry_to_dict(telemetry, data_key)
             _write_json(file_path, tel_data)
             return True
@@ -546,11 +854,13 @@ class PreSeasonExtractor:
 
     def process_driver(
         self,
-        test_number: int,
-        session_number: int,
+        round_number: int,
+        event_name: str,
+        session_name: str,
         driver: str,
         base_dir: str,
         f1session: fastf1.core.Session = None,
+        session_weather_df: pd.DataFrame = None,
     ) -> None:
         driver_dir = f"{base_dir}/{driver}"
         os.makedirs(driver_dir, exist_ok=True)
@@ -558,7 +868,7 @@ class PreSeasonExtractor:
         try:
             if f1session is None:
                 f1session = self.get_session(
-                    test_number, session_number, load_telemetry=True
+                    round_number, session_name, load_telemetry=True
                 )
 
             driver_laps = f1session.laps.pick_drivers(driver)
@@ -566,7 +876,7 @@ class PreSeasonExtractor:
                 LapNumber=driver_laps["LapNumber"].astype(int)
             )
 
-            laptimes = self.laps_data(driver, f1session, driver_laps)
+            laptimes = self.laps_data(driver, f1session, driver_laps, session_weather_df)
             _write_json(f"{driver_dir}/laptimes.json", laptimes)
 
             lap_numbers = driver_laps["LapNumber"].tolist()
@@ -582,35 +892,40 @@ class PreSeasonExtractor:
                 if fname in existing:
                     continue
                 self._process_single_lap(
-                    driver, lap_number, driver_dir, driver_laps,
-                    test_number, session_number,
+                    driver, lap_number, driver_dir, driver_laps, event_name, session_name
                 )
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {e}")
 
-    def process_testing_session(
-        self, test_number: int, session_number: int
+    def process_event_session(
+        self, round_number: int, event_name: str, session_name: str
     ) -> None:
-        label = f"Test {test_number} - Practice {session_number}"
+        label = f"Round {round_number} - {event_name} - {session_name}"
         logger.info(f"Processing {label}")
 
-        # specific requirement: /Pre-Season Testing/Practice {N}
-        # User requested to remove year from the start of base_dir
-        base_dir = (
-            f"Pre-Season Testing/Practice {session_number}"
-        )
+        base_dir = f"{self.year}/{event_name}/{session_name}"
         os.makedirs(base_dir, exist_ok=True)
 
         try:
-            f1session = self.get_session(
-                test_number, session_number, load_telemetry=True
+            f1session = self.get_session(round_number, session_name, load_telemetry=True)
+
+            weather_data = _session_weather_to_column_lists(f1session.weather_data)
+            _write_json(
+                f"{base_dir}/weather.json", weather_data, normalize_missing=True
             )
 
-            drivers_info = self.session_drivers(test_number, session_number)
+            session_control_messages = _session_rcm_to_column_lists(
+                f1session.race_control_messages
+            )
+            _write_json(
+                f"{base_dir}/rcm.json", session_control_messages, normalize_missing=True
+            )
+
+            drivers_info = self.session_drivers(round_number, session_name)
             _write_json(f"{base_dir}/drivers.json", drivers_info)
 
-            corner_info = self.get_circuit_info(test_number, session_number)
+            corner_info = self.get_circuit_info(round_number, session_name)
             if corner_info:
                 _write_json(f"{base_dir}/corners.json", corner_info)
 
@@ -620,51 +935,66 @@ class PreSeasonExtractor:
                 logger.warning(f"No drivers found for {label}")
                 return
 
-            # Process drivers sequentially for stability and lowest memory overhead
-            # (Benchmarks showed sequential is faster than parallel for single-session extraction)
+            session_weather_df = None
+            if hasattr(f1session.laps, "get_weather_data"):
+                try:
+                    session_weather_df = f1session.laps.get_weather_data()
+                except Exception:
+                    pass
+
             total_drivers = len(drivers)
             for i, driver in enumerate(drivers, 1):
                 logger.info(f"Processing driver {driver} ({i}/{total_drivers})")
                 self.process_driver(
-                    test_number, session_number, driver, base_dir, f1session
+                    round_number,
+                    event_name,
+                    session_name,
+                    driver,
+                    base_dir,
+                    f1session,
+                    session_weather_df,
                 )
-
-
         except Exception as e:
             logger.error(f"Error processing {label}: {e}")
 
     def process_all(self) -> None:
-        logger.info(f"Starting pre-season testing extraction for {self.year}")
+        logger.info(f"Starting season session extraction for {self.year}")
         start_time = time.time()
 
-        events = self.discover_testing_events()
+        events = self.discover_events()
         if not events:
-            logger.warning("No testing events found — nothing to extract.")
+            logger.warning("No events found — nothing to extract.")
             return
 
-        for evt in events:
-            test_num = evt["test_number"]
-            test_num = evt["test_number"]
+        target_sessions = set(TARGET_SESSIONS) if TARGET_SESSIONS else None
 
-            if TARGET_TEST_NUMBER is not None and test_num != TARGET_TEST_NUMBER:
+        for evt in events:
+            round_number = evt["round_number"]
+            event_name = evt["event_name"]
+            sessions = evt["sessions"]
+
+            if TARGET_EVENT_NAME is not None and event_name != TARGET_EVENT_NAME:
                 continue
 
-            n_sessions = evt["sessions"]
-
-            logger.info(
-                f"Processing Test {test_num}: {evt['event_name']} "
-                f"({n_sessions} sessions)"
-            )
-
-            for session_num in range(1, n_sessions + 1):
-                if TARGET_SESSION_NUMBER is not None and session_num != TARGET_SESSION_NUMBER:
+            if target_sessions is not None:
+                sessions = [s for s in sessions if s in target_sessions]
+                if not sessions:
+                    logger.info(
+                        f"Skipping Round {round_number} ({event_name}) due to session filter"
+                    )
                     continue
 
+            logger.info(
+                f"Processing Round {round_number}: {event_name} "
+                f"({', '.join(sessions)})"
+            )
+
+            for session_name in sessions:
                 try:
-                    self.process_testing_session(test_num, session_num)
+                    self.process_event_session(round_number, event_name, session_name)
                 except Exception as e:
                     logger.error(
-                        f"Failed Test {test_num} Session {session_num}: {e}"
+                        f"Failed Round {round_number} {event_name} {session_name}: {e}"
                     )
                 check_memory_usage(
                     session_cache=self._session_cache,
@@ -672,67 +1002,78 @@ class PreSeasonExtractor:
                 )
 
         elapsed = time.time() - start_time
-        logger.info(
-            f"Pre-season testing extraction completed in {elapsed:.2f} seconds"
-        )
+        logger.info(f"Season session extraction completed in {elapsed:.2f} seconds")
 
 
 # ======================================================================
 # Data Availability
 # ======================================================================
-def is_testing_data_available(year: int) -> bool:
-    """Check if any pre-season testing data is available by scanning all sessions."""
+def is_session_data_available(year: int) -> bool:
+    """Check if any season session data is available for configured filters."""
     try:
-        # Enforce 'fastf1' backend to strictly avoid 'Day 1' session issues
-        # and get the full schedule to know what to check
-        schedule = fastf1.get_event_schedule(year, include_testing=True, backend="fastf1")
-        testing = schedule[schedule["EventFormat"] == "testing"]
+        schedule = fastf1.get_event_schedule(year, include_testing=False)
+        if "EventFormat" in schedule.columns:
+            schedule = schedule[schedule["EventFormat"] != "testing"]
 
-        if testing.empty:
-            logger.info(f"No testing events found in {year} schedule yet.")
+        if schedule.empty:
+            logger.info(f"No events found in {year} schedule yet.")
             return False
 
-        # Iterate through all testing events and their sessions
-        for idx, (_, row) in enumerate(testing.iterrows(), start=1):
-            if TARGET_TEST_NUMBER is not None and idx != TARGET_TEST_NUMBER:
+        target_sessions = set(TARGET_SESSIONS) if TARGET_SESSIONS else None
+
+        for _, row in schedule.iterrows():
+            round_raw = row.get("RoundNumber")
+            if pd.isna(round_raw):
                 continue
 
-            # Check up to 5 sessions per event
-            for s_num in range(1, 6):
-                if TARGET_SESSION_NUMBER is not None and s_num != TARGET_SESSION_NUMBER:
-                    continue
+            try:
+                round_number = int(round_raw)
+            except (TypeError, ValueError):
+                continue
 
+            event_name = str(row.get("EventName", f"Round {round_number}")).strip()
+
+            if TARGET_EVENT_NAME is not None and event_name != TARGET_EVENT_NAME:
+                continue
+
+            sessions = []
+            for s_num in range(1, 6):
                 col = f"Session{s_num}"
                 if col not in row.index:
                     continue
-
-                # Check if session exists in schedule
                 val = row[col]
-                if pd.isna(val) or str(val).strip() in ("", "None"):
+                if pd.isna(val):
                     continue
+                session_name = str(val).strip()
+                if session_name and session_name not in ("None", "nan"):
+                    sessions.append(session_name)
 
+            if not sessions:
+                sessions = ["Race"]
+
+            if target_sessions is not None:
+                sessions = [s for s in sessions if s in target_sessions]
+
+            for session_name in sessions:
                 try:
-                    # Attempt to load this specific session
-                    f1session = fastf1.get_testing_session(
-                        year, idx, s_num, backend="fastf1"
-                    )
-                    # Minimal load to check for data
+                    f1session = fastf1.get_session(year, round_number, session_name)
                     f1session.load(telemetry=False, weather=False, messages=False)
 
                     if not f1session.laps.empty and len(f1session.laps["Driver"].unique()) > 0:
                         logger.info(
-                            f"Data detected for Test {idx} Session {s_num}. "
-                            "Extraction checks passed."
+                            f"Data detected for Round {round_number} "
+                            f"{event_name} {session_name}."
                         )
                         return True
                 except Exception:
-                    # If a specific session fails, continue checking others
                     continue
 
-        logger.info(f"No data available yet for any {year} pre-season testing session")
+        logger.info(
+            f"No data available yet for any {year} season event/session matching filters"
+        )
         return False
     except Exception as e:
-        logger.warning(f"Testing data check failed: {e}")
+        logger.warning(f"Session data check failed: {e}")
         return False
 
 
@@ -740,21 +1081,20 @@ def main():
     try:
         year = DEFAULT_YEAR
 
-        # Use separate cache to avoid pollution from main scripts
-        os.makedirs("cache_preseason", exist_ok=True)
-        fastf1.Cache.enable_cache("cache_preseason")
+        os.makedirs("cache", exist_ok=True)
+        fastf1.Cache.enable_cache("cache")
 
-        extractor = PreSeasonExtractor(year=year)
+        extractor = SeasonSessionExtractor(year=year)
         max_attempts = 720
         wait_time = 30
         attempt = 0
 
-        logger.info(f"Starting to wait for {year} pre-season testing data...")
+        logger.info(f"Starting to wait for {year} season session data...")
 
         while attempt < max_attempts:
-            if is_testing_data_available(year):
+            if is_session_data_available(year):
                 logger.info(
-                    f"Data is available for {year} pre-season testing. "
+                    f"Data is available for {year} season sessions. "
                     "Starting extraction..."
                 )
                 extractor.process_all()
