@@ -97,10 +97,15 @@ def _td_col_to_seconds(series: pd.Series) -> list:
     return out.tolist()
 
 
-def _col_to_list_str_or_none(series: pd.Series) -> list:
-    if series.empty:
+def _col_to_list_str_or_none(col) -> list:
+    if isinstance(col, np.ndarray):
+        vals = col
+    else:
+        if col.empty:
+            return []
+        vals = col.to_numpy()
+    if len(vals) == 0:
         return []
-    vals = series.to_numpy()
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
     out[mask] = "None"
@@ -232,12 +237,12 @@ def _process_telemetry_to_dict(telemetry: pd.DataFrame, data_key: str) -> dict:
     ax, ay, az, time_s = _compute_accelerations(speed, time_arr, x, y, z, dist)
 
     drs_raw = telemetry["DRS"].to_numpy()
-    drs = ((drs_raw == 10) | (drs_raw == 12) | (drs_raw == 14)).astype(np.int8)
+    drs = np.isin(drs_raw, [10, 12, 14]).astype(np.int8)
     brake = telemetry["Brake"].to_numpy().astype(bool).astype(np.int8)
     driver_ahead = (
         telemetry["DriverAhead"]
         if "DriverAhead" in telemetry.columns
-        else pd.Series(np.nan, index=telemetry.index)
+        else np.full(len(telemetry), np.nan)
     )
     distance_to_driver_ahead = (
         telemetry["DistanceToDriverAhead"].to_numpy()
@@ -257,6 +262,8 @@ def _process_telemetry_to_dict(telemetry: pd.DataFrame, data_key: str) -> dict:
             "distance": _array_to_list_float_or_none(dist),
             "rel_distance": _array_to_list_float_or_none(
                 telemetry["RelativeDistance"].to_numpy()
+                if "RelativeDistance" in telemetry.columns
+                else np.full(len(telemetry), np.nan, dtype=np.float64)
             ),
             "DriverAhead": _col_to_list_str_or_none(driver_ahead),
             "DistanceToDriverAhead": _array_to_list_float_or_none(
