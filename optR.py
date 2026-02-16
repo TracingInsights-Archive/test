@@ -29,7 +29,7 @@ import requests
 
 DEFAULT_YEAR = 2025
 # Keep exactly one uncommented event in this list.
-TARGET_EVENT_NAME = [
+TARGET_EVENT_NAMES_LIST = [
     # "Pre-Season Testing",
     # "Australian Grand Prix",
     # "Chinese Grand Prix",
@@ -56,12 +56,12 @@ TARGET_EVENT_NAME = [
     # "Qatar Grand Prix",
     "Abu Dhabi Grand Prix",
 ]
-if len(TARGET_EVENT_NAME) != 1:
+if len(TARGET_EVENT_NAMES_LIST) != 1:
     raise ValueError(
         "Set exactly one active event in TARGET_EVENT_NAME "
         "(comment all others)."
     )
-TARGET_EVENT_NAME = TARGET_EVENT_NAME[0]
+TARGET_EVENT_NAME = TARGET_EVENT_NAMES_LIST[0]
 AVAILABLE_SESSIONS = [
     "Practice 1",
     "Practice 2",
@@ -571,7 +571,7 @@ class SeasonSessionExtractor:
         return events
 
     def get_session(
-        self, round_number: int, session_name: str, load_telemetry: bool = False
+        self, round_number: int, session_name: str, load_telemetry: bool = True
     ) -> fastf1.core.Session:
         cache_key = f"{self.year}-R{round_number}-{session_name}"
         cached = self._session_cache.get(cache_key)
@@ -904,7 +904,7 @@ class SeasonSessionExtractor:
         label = f"Round {round_number} - {event_name} - {session_name}"
         logger.info(f"Processing {label}")
 
-        base_dir = f"{self.year}/{event_name}/{session_name}"
+        base_dir = f"{event_name}/{session_name}"
         os.makedirs(base_dir, exist_ok=True)
 
         try:
@@ -1008,72 +1008,51 @@ class SeasonSessionExtractor:
 # ======================================================================
 # Data Availability
 # ======================================================================
-def is_session_data_available(year: int) -> bool:
-    """Check if any season session data is available for configured filters."""
-    try:
-        schedule = fastf1.get_event_schedule(year, include_testing=False)
-        if "EventFormat" in schedule.columns:
-            schedule = schedule[schedule["EventFormat"] != "testing"]
 
-        if schedule.empty:
-            logger.info(f"No events found in {year} schedule yet.")
+
+
+
+def is_session_data_available(
+    year: int,
+    events: Optional[List[str]] = None,
+    sessions: Optional[List[str]] = None,
+) -> bool:
+    """Check if data is available for the first specified event/session pair."""
+    try:
+        if events is None:
+            events = [TARGET_EVENT_NAME] if TARGET_EVENT_NAME else []
+        if sessions is None:
+            sessions = list(TARGET_SESSIONS)
+
+        if not events or not sessions:
+            logger.warning("No events or sessions specified to check")
             return False
 
-        target_sessions = set(TARGET_SESSIONS) if TARGET_SESSIONS else None
+        event = events[0]
+        session = sessions[0]
 
-        for _, row in schedule.iterrows():
-            round_raw = row.get("RoundNumber")
-            if pd.isna(round_raw):
-                continue
+        logger.info(f"Checking data availability for {year} {event} {session}...")
 
-            try:
-                round_number = int(round_raw)
-            except (TypeError, ValueError):
-                continue
+        f1session = fastf1.get_session(year, event, session)
+        f1session.load(telemetry=False, weather=False, messages=False)
 
-            event_name = str(row.get("EventName", f"Round {round_number}")).strip()
+        if f1session.laps.empty:
+            logger.info(f"No lap data available yet for {year} {event} {session}")
+            return False
 
-            if TARGET_EVENT_NAME is not None and event_name != TARGET_EVENT_NAME:
-                continue
+        if "Driver" not in f1session.laps.columns:
+            logger.info(f"No driver data available yet for {year} {event} {session}")
+            return False
 
-            sessions = []
-            for s_num in range(1, 6):
-                col = f"Session{s_num}"
-                if col not in row.index:
-                    continue
-                val = row[col]
-                if pd.isna(val):
-                    continue
-                session_name = str(val).strip()
-                if session_name and session_name not in ("None", "nan"):
-                    sessions.append(session_name)
+        if len(f1session.laps["Driver"].dropna().unique()) == 0:
+            logger.info(f"No driver data available yet for {year} {event} {session}")
+            return False
 
-            if not sessions:
-                sessions = ["Race"]
+        logger.info(f"Data is available for {year} {event} {session}")
+        return True
 
-            if target_sessions is not None:
-                sessions = [s for s in sessions if s in target_sessions]
-
-            for session_name in sessions:
-                try:
-                    f1session = fastf1.get_session(year, round_number, session_name)
-                    f1session.load(telemetry=False, weather=False, messages=False)
-
-                    if not f1session.laps.empty and len(f1session.laps["Driver"].unique()) > 0:
-                        logger.info(
-                            f"Data detected for Round {round_number} "
-                            f"{event_name} {session_name}."
-                        )
-                        return True
-                except Exception:
-                    continue
-
-        logger.info(
-            f"No data available yet for any {year} season event/session matching filters"
-        )
-        return False
     except Exception as e:
-        logger.warning(f"Session data check failed: {e}")
+        logger.info(f"Data not yet available: {str(e)}")
         return False
 
 
