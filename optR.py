@@ -14,6 +14,7 @@ import gc
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import fastf1
@@ -112,7 +113,7 @@ logger = logging.getLogger("session_extractor")
 logging.getLogger("fastf1").setLevel(logging.WARNING)
 logging.getLogger("fastf1").propagate = False
 
-_MISSING_TEXT_VALUES = {
+_MISSING_TEXT_VALUES = frozenset({
     "",
     "null",
     "nan",
@@ -122,7 +123,8 @@ _MISSING_TEXT_VALUES = {
     "-inf",
     "infinity",
     "-infinity",
-}
+})
+_MISSING_TEXT_LIST = list(_MISSING_TEXT_VALUES)
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +157,14 @@ def _col_to_list_str_or_none(col) -> list:
     if len(vals) == 0:
         return []
     mask = pd.isna(vals)
+    valid = ~mask
     out = np.empty(vals.shape, dtype=object)
     out[mask] = "None"
-    valid_vals = vals[~mask]
+    valid_vals = vals[valid]
     s_vals = np.array([str(v).strip().lower() for v in valid_vals])
-    missing_mask = np.isin(s_vals, list(_MISSING_TEXT_VALUES))
+    missing_mask = np.isin(s_vals, _MISSING_TEXT_LIST)
     str_vals = np.array([str(v) for v in valid_vals])
-    out[~mask] = np.where(missing_mask, "None", str_vals)
+    out[valid] = np.where(missing_mask, "None", str_vals)
     return out.tolist()
 
 
@@ -216,7 +219,7 @@ def _series_to_json_list(series: pd.Series) -> list:
     else:
         valid_vals = vals[valid]
         s_vals = np.array([str(v).strip().lower() for v in valid_vals])
-        missing_mask = np.isin(s_vals, list(_MISSING_TEXT_VALUES))
+        missing_mask = np.isin(s_vals, _MISSING_TEXT_LIST)
         str_vals = np.array([str(v) for v in valid_vals])
         out[valid] = np.where(missing_mask, "None", str_vals)
 
@@ -338,12 +341,12 @@ def _lap_weather_to_column_lists(laps: pd.DataFrame, weather_df: pd.DataFrame = 
 def _array_to_list_float_or_none(arr: np.ndarray) -> list:
     if arr.size == 0:
         return []
-    mask = ~np.isfinite(arr)
-    if not mask.any():
+    valid = np.isfinite(arr)
+    if valid.all():
         return arr.tolist()
     out = np.empty(arr.shape, dtype=object)
-    out[mask] = "None"
-    out[~mask] = arr[~mask]
+    out[~valid] = "None"
+    out[valid] = arr[valid]
     return out.tolist()
 
 
@@ -518,58 +521,6 @@ class SeasonSessionExtractor:
         self._session_cache: Dict[str, fastf1.core.Session] = {}
         self._circuit_cache: Dict[str, dict] = {}
 
-    def discover_events(self) -> List[dict]:
-        """Return non-testing events with round number and available sessions."""
-        schedule = fastf1.get_event_schedule(self.year, include_testing=False)
-        if "EventFormat" in schedule.columns:
-            schedule = schedule[schedule["EventFormat"] != "testing"]
-
-        events = []
-        for _, row in schedule.iterrows():
-            round_raw = row.get("RoundNumber")
-            if pd.isna(round_raw):
-                continue
-
-            try:
-                round_number = int(round_raw)
-            except (TypeError, ValueError):
-                continue
-
-            event_name = str(row.get("EventName", f"Round {round_number}")).strip()
-            sessions = []
-
-            for s in range(1, 6):
-                col = f"Session{s}"
-                if col not in row.index:
-                    continue
-                val = row[col]
-                if pd.isna(val):
-                    continue
-                session_name = str(val).strip()
-                if session_name and session_name not in ("None", "nan"):
-                    sessions.append(session_name)
-
-            if not sessions:
-                sessions = ["Race"]
-
-            events.append(
-                {
-                    "round_number": round_number,
-                    "event_name": event_name,
-                    "sessions": sessions,
-                }
-            )
-
-        events.sort(key=lambda e: e["round_number"])
-
-        logger.info(f"Discovered {len(events)} season event(s) for {self.year}")
-        for e in events:
-            logger.info(
-                f"  Round {e['round_number']}: {e['event_name']} "
-                f"({', '.join(e['sessions'])})"
-            )
-        return events
-
     def get_session(
         self, round_number: int, session_name: str, load_telemetry: bool = True
     ) -> fastf1.core.Session:
@@ -590,10 +541,11 @@ class SeasonSessionExtractor:
         return f1session
 
     def session_drivers(
-        self, round_number: int, session_name: str
+        self, round_number: int, session_name: str, f1session: fastf1.core.Session = None
     ) -> Dict[str, List[Dict[str, str]]]:
         try:
-            f1session = self.get_session(round_number, session_name)
+            if f1session is None:
+                f1session = self.get_session(round_number, session_name)
             laps = f1session.laps
             driver_cols = ["Driver", "Team"]
             has_driver_number = "DriverNumber" in laps.columns
@@ -887,13 +839,17 @@ class SeasonSessionExtractor:
                 else set()
             )
 
-            for lap_number in lap_numbers:
-                fname = f"{lap_number}_tel.json"
-                if fname in existing:
-                    continue
-                self._process_single_lap(
-                    driver, lap_number, driver_dir, driver_laps, event_name, session_name
-                )
+            pending = [
+                ln for ln in lap_numbers if f"{ln}_tel.json" not in existing
+            ]
+            if pending:
+                with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+                    pool.map(
+                        lambda ln: self._process_single_lap(
+                            driver, ln, driver_dir, driver_laps, event_name, session_name
+                        ),
+                        pending,
+                    )
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {e}")
@@ -911,18 +867,14 @@ class SeasonSessionExtractor:
             f1session = self.get_session(round_number, session_name, load_telemetry=True)
 
             weather_data = _session_weather_to_column_lists(f1session.weather_data)
-            _write_json(
-                f"{base_dir}/weather.json", weather_data, normalize_missing=True
-            )
+            _write_json(f"{base_dir}/weather.json", weather_data)
 
             session_control_messages = _session_rcm_to_column_lists(
                 f1session.race_control_messages
             )
-            _write_json(
-                f"{base_dir}/rcm.json", session_control_messages, normalize_missing=True
-            )
+            _write_json(f"{base_dir}/rcm.json", session_control_messages)
 
-            drivers_info = self.session_drivers(round_number, session_name)
+            drivers_info = self.session_drivers(round_number, session_name, f1session)
             _write_json(f"{base_dir}/drivers.json", drivers_info)
 
             corner_info = self.get_circuit_info(round_number, session_name)
@@ -943,7 +895,9 @@ class SeasonSessionExtractor:
                     pass
 
             total_drivers = len(drivers)
-            for i, driver in enumerate(drivers, 1):
+
+            def _do_driver(i_driver):
+                i, driver = i_driver
                 logger.info(f"Processing driver {driver} ({i}/{total_drivers})")
                 self.process_driver(
                     round_number,
@@ -954,6 +908,9 @@ class SeasonSessionExtractor:
                     f1session,
                     session_weather_df,
                 )
+
+            with ThreadPoolExecutor(max_workers=min(4, total_drivers)) as pool:
+                list(pool.map(_do_driver, enumerate(drivers, 1)))
         except Exception as e:
             logger.error(f"Error processing {label}: {e}")
 
@@ -961,7 +918,54 @@ class SeasonSessionExtractor:
         logger.info(f"Starting season session extraction for {self.year}")
         start_time = time.time()
 
-        events = self.discover_events()
+        schedule = fastf1.get_event_schedule(self.year, include_testing=False)
+        if "EventFormat" in schedule.columns:
+            schedule = schedule[schedule["EventFormat"] != "testing"]
+
+        events = []
+        for _, row in schedule.iterrows():
+            round_raw = row.get("RoundNumber")
+            if pd.isna(round_raw):
+                continue
+
+            try:
+                round_number = int(round_raw)
+            except (TypeError, ValueError):
+                continue
+
+            event_name = str(row.get("EventName", f"Round {round_number}")).strip()
+            sessions = []
+
+            for s in range(1, 6):
+                col = f"Session{s}"
+                if col not in row.index:
+                    continue
+                val = row[col]
+                if pd.isna(val):
+                    continue
+                session_name = str(val).strip()
+                if session_name and session_name not in ("None", "nan"):
+                    sessions.append(session_name)
+
+            if not sessions:
+                sessions = ["Race"]
+
+            events.append(
+                {
+                    "round_number": round_number,
+                    "event_name": event_name,
+                    "sessions": sessions,
+                }
+            )
+
+        events.sort(key=lambda e: e["round_number"])
+        logger.info(f"Discovered {len(events)} season event(s) for {self.year}")
+        for evt in events:
+            logger.info(
+                f"  Round {evt['round_number']}: {evt['event_name']} "
+                f"({', '.join(evt['sessions'])})"
+            )
+
         if not events:
             logger.warning("No events found — nothing to extract.")
             return
