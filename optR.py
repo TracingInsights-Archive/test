@@ -522,9 +522,9 @@ class SeasonSessionExtractor:
         self._circuit_cache: Dict[str, dict] = {}
 
     def get_session(
-        self, round_number: int, session_name: str, load_telemetry: bool = True
+        self, event_name: str, session_name: str, load_telemetry: bool = True
     ) -> fastf1.core.Session:
-        cache_key = f"{self.year}-R{round_number}-{session_name}"
+        cache_key = f"{self.year}-{event_name}-{session_name}"
         cached = self._session_cache.get(cache_key)
 
         if cached is not None:
@@ -534,18 +534,18 @@ class SeasonSessionExtractor:
                 self._session_cache[cache_key] = cached
             return cached
 
-        f1session = fastf1.get_session(self.year, round_number, session_name)
+        f1session = fastf1.get_session(self.year, event_name, session_name)
         f1session.load(telemetry=load_telemetry, weather=True, messages=True)
         f1session._telemetry_loaded = load_telemetry
         self._session_cache[cache_key] = f1session
         return f1session
 
     def session_drivers(
-        self, round_number: int, session_name: str, f1session: fastf1.core.Session = None
+        self, event_name: str, session_name: str, f1session: fastf1.core.Session = None
     ) -> Dict[str, List[Dict[str, str]]]:
         try:
             if f1session is None:
-                f1session = self.get_session(round_number, session_name)
+                f1session = self.get_session(event_name, session_name)
             laps = f1session.laps
             driver_cols = ["Driver", "Team"]
             has_driver_number = "DriverNumber" in laps.columns
@@ -578,7 +578,7 @@ class SeasonSessionExtractor:
             return {"drivers": drivers}
         except Exception as e:
             logger.error(
-                f"Error getting drivers for Round {round_number} {session_name}: {e}"
+                f"Error getting drivers for {event_name} {session_name}: {e}"
             )
             return {"drivers": []}
 
@@ -695,14 +695,14 @@ class SeasonSessionExtractor:
             }
 
     def get_circuit_info(
-        self, round_number: int, session_name: str
+        self, event_name: str, session_name: str
     ) -> Optional[Dict]:
-        cache_key = f"{self.year}-R{round_number}-{session_name}"
+        cache_key = f"{self.year}-{event_name}-{session_name}"
         if cache_key in self._circuit_cache:
             return self._circuit_cache[cache_key]
 
         try:
-            f1session = self.get_session(round_number, session_name)
+            f1session = self.get_session(event_name, session_name)
             circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
             try:
@@ -733,12 +733,12 @@ class SeasonSessionExtractor:
                     return result
 
             logger.warning(
-                f"Could not get corner data for Round {round_number} {session_name}"
+                f"Could not get corner data for {event_name} {session_name}"
             )
             return None
         except Exception as e:
             logger.error(
-                f"Error getting circuit info for Round {round_number} {session_name}: {e}"
+                f"Error getting circuit info for {event_name} {session_name}: {e}"
             )
             return None
 
@@ -806,7 +806,6 @@ class SeasonSessionExtractor:
 
     def process_driver(
         self,
-        round_number: int,
         event_name: str,
         session_name: str,
         driver: str,
@@ -820,7 +819,7 @@ class SeasonSessionExtractor:
         try:
             if f1session is None:
                 f1session = self.get_session(
-                    round_number, session_name, load_telemetry=True
+                    event_name, session_name, load_telemetry=True
                 )
 
             driver_laps = f1session.laps.pick_drivers(driver)
@@ -854,17 +853,15 @@ class SeasonSessionExtractor:
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {e}")
 
-    def process_event_session(
-        self, round_number: int, event_name: str, session_name: str
-    ) -> None:
-        label = f"Round {round_number} - {event_name} - {session_name}"
+    def process_event_session(self, event_name: str, session_name: str) -> None:
+        label = f"{event_name} - {session_name}"
         logger.info(f"Processing {label}")
 
         base_dir = f"{event_name}/{session_name}"
         os.makedirs(base_dir, exist_ok=True)
 
         try:
-            f1session = self.get_session(round_number, session_name, load_telemetry=True)
+            f1session = self.get_session(event_name, session_name, load_telemetry=True)
 
             weather_data = _session_weather_to_column_lists(f1session.weather_data)
             _write_json(f"{base_dir}/weather.json", weather_data)
@@ -874,10 +871,10 @@ class SeasonSessionExtractor:
             )
             _write_json(f"{base_dir}/rcm.json", session_control_messages)
 
-            drivers_info = self.session_drivers(round_number, session_name, f1session)
+            drivers_info = self.session_drivers(event_name, session_name, f1session)
             _write_json(f"{base_dir}/drivers.json", drivers_info)
 
-            corner_info = self.get_circuit_info(round_number, session_name)
+            corner_info = self.get_circuit_info(event_name, session_name)
             if corner_info:
                 _write_json(f"{base_dir}/corners.json", corner_info)
 
@@ -900,7 +897,6 @@ class SeasonSessionExtractor:
                 i, driver = i_driver
                 logger.info(f"Processing driver {driver} ({i}/{total_drivers})")
                 self.process_driver(
-                    round_number,
                     event_name,
                     session_name,
                     driver,
@@ -918,92 +914,26 @@ class SeasonSessionExtractor:
         logger.info(f"Starting season session extraction for {self.year}")
         start_time = time.time()
 
-        schedule = fastf1.get_event_schedule(self.year, include_testing=False)
-        if "EventFormat" in schedule.columns:
-            schedule = schedule[schedule["EventFormat"] != "testing"]
-
-        events = []
-        for _, row in schedule.iterrows():
-            round_raw = row.get("RoundNumber")
-            if pd.isna(round_raw):
-                continue
-
-            try:
-                round_number = int(round_raw)
-            except (TypeError, ValueError):
-                continue
-
-            event_name = str(row.get("EventName", f"Round {round_number}")).strip()
-            sessions = []
-
-            for s in range(1, 6):
-                col = f"Session{s}"
-                if col not in row.index:
-                    continue
-                val = row[col]
-                if pd.isna(val):
-                    continue
-                session_name = str(val).strip()
-                if session_name and session_name not in ("None", "nan"):
-                    sessions.append(session_name)
-
-            if not sessions:
-                sessions = ["Race"]
-
-            events.append(
-                {
-                    "round_number": round_number,
-                    "event_name": event_name,
-                    "sessions": sessions,
-                }
-            )
-
-        events.sort(key=lambda e: e["round_number"])
-        logger.info(f"Discovered {len(events)} season event(s) for {self.year}")
-        for evt in events:
-            logger.info(
-                f"  Round {evt['round_number']}: {evt['event_name']} "
-                f"({', '.join(evt['sessions'])})"
-            )
-
-        if not events:
-            logger.warning("No events found — nothing to extract.")
+        event_name = TARGET_EVENT_NAME.strip() if TARGET_EVENT_NAME else ""
+        if not event_name:
+            logger.warning("No TARGET_EVENT_NAME configured — nothing to extract.")
             return
 
-        target_sessions = set(TARGET_SESSIONS) if TARGET_SESSIONS else None
+        sessions = [s for s in TARGET_SESSIONS if isinstance(s, str) and s.strip()]
+        if not sessions:
+            logger.warning("No TARGET_SESSIONS configured — nothing to extract.")
+            return
 
-        for evt in events:
-            round_number = evt["round_number"]
-            event_name = evt["event_name"]
-            sessions = evt["sessions"]
-
-            if TARGET_EVENT_NAME is not None and event_name != TARGET_EVENT_NAME:
-                continue
-
-            if target_sessions is not None:
-                sessions = [s for s in sessions if s in target_sessions]
-                if not sessions:
-                    logger.info(
-                        f"Skipping Round {round_number} ({event_name}) due to session filter"
-                    )
-                    continue
-
-            logger.info(
-                f"Processing Round {round_number}: {event_name} "
-                f"({', '.join(sessions)})"
+        logger.info(f"Processing {event_name} ({', '.join(sessions)})")
+        for session_name in sessions:
+            try:
+                self.process_event_session(event_name, session_name)
+            except Exception as e:
+                logger.error(f"Failed {event_name} {session_name}: {e}")
+            check_memory_usage(
+                session_cache=self._session_cache,
+                circuit_cache=self._circuit_cache,
             )
-
-            for session_name in sessions:
-                try:
-                    self.process_event_session(round_number, event_name, session_name)
-                except Exception as e:
-                    logger.error(
-                        f"Failed Round {round_number} {event_name} {session_name}: {e}"
-                    )
-                check_memory_usage(
-                    session_cache=self._session_cache,
-                    circuit_cache=self._circuit_cache,
-                )
 
         elapsed = time.time() - start_time
         logger.info(f"Season session extraction completed in {elapsed:.2f} seconds")
