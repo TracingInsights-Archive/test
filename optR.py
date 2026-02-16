@@ -14,7 +14,6 @@ import gc
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import fastf1
@@ -838,17 +837,13 @@ class SeasonSessionExtractor:
                 else set()
             )
 
-            pending = [
-                ln for ln in lap_numbers if f"{ln}_tel.json" not in existing
-            ]
-            if pending:
-                with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
-                    pool.map(
-                        lambda ln: self._process_single_lap(
-                            driver, ln, driver_dir, driver_laps, event_name, session_name
-                        ),
-                        pending,
-                    )
+            for lap_number in lap_numbers:
+                fname = f"{lap_number}_tel.json"
+                if fname in existing:
+                    continue
+                self._process_single_lap(
+                    driver, lap_number, driver_dir, driver_laps, event_name, session_name
+                )
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {e}")
@@ -892,9 +887,7 @@ class SeasonSessionExtractor:
                     pass
 
             total_drivers = len(drivers)
-
-            def _do_driver(i_driver):
-                i, driver = i_driver
+            for i, driver in enumerate(drivers, 1):
                 logger.info(f"Processing driver {driver} ({i}/{total_drivers})")
                 self.process_driver(
                     event_name,
@@ -904,9 +897,6 @@ class SeasonSessionExtractor:
                     f1session,
                     session_weather_df,
                 )
-
-            with ThreadPoolExecutor(max_workers=min(4, total_drivers)) as pool:
-                list(pool.map(_do_driver, enumerate(drivers, 1)))
         except Exception as e:
             logger.error(f"Error processing {label}: {e}")
 
