@@ -1,63 +1,87 @@
+"""
+Pre-Season Testing Telemetry Extraction Script
+================================================
+Extracts telemetry data from F1 pre-season testing sessions.
+
+Key differences from main_optimized.py (race weekends):
+- Uses fastf1.get_testing_session(year, test_number, session_number)
+- Uses fastf1.get_event_schedule(year, include_testing=True)
+- Output directory:  {year}/Pre-Season Testing/Test {N}/Day {M}/
+- Standalone: Use "cache_preseason" to avoid conflicts with main script
+"""
+
 import gc
 import logging
 import os
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import fastf1
-from fastf1.core import Telemetry
 import numpy as np
 import orjson
 import pandas as pd
 import psutil
 import requests
-import utils
-
 
 # ---------------------------------------------------------------------------
-# Patch fastf1: skip expensive add_driver_ahead (461ms/lap, unused by us).
-# This scans ALL other drivers' position data per sample — we never use the
-# DriverAhead / DistanceToDriverAhead columns.  Replacing it with a stub
-# that returns dummy columns preserves the exact merge/resample/interpolation
-# flow of get_telemetry() while eliminating the dominant per-lap bottleneck.
-# Validated: maxdiff = 0.0 on all output fields vs original.
+# Monkeypatch: Fix FastF1 2026 Pre-Season Path (Day N vs Practice N)
 # ---------------------------------------------------------------------------
-def _stub_add_driver_ahead(self, **kwargs):
-    result = self.copy()
-    result["DriverAhead"] = ""
-    result["DistanceToDriverAhead"] = np.float64(0.0)
-    return result
+import fastf1._api
+_original_make_path = fastf1._api.make_path
 
+def _patched_make_path(wname, wdate, sname, sdate):
+    path = _original_make_path(wname, wdate, sname, sdate)
+    if "2026" in wdate:
+        if "Practice_1" in path:
+            path = path.replace("Practice_1", "Day_1")
+        elif "Practice_2" in path:
+            path = path.replace("Practice_2", "Day_2")
+        elif "Practice_3" in path:
+            path = path.replace("Practice_3", "Day_3")
+    return path
 
-Telemetry.add_driver_ahead = _stub_add_driver_ahead
+fastf1._api.make_path = _patched_make_path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("telemetry_extraction.log"), logging.StreamHandler()],
-)
-logger = logging.getLogger("telemetry_extractor")
-logging.getLogger("fastf1").setLevel(logging.WARNING)
-logging.getLogger("fastf1").propagate = False
+# ---------------------------------------------------------------------------
+# Constants & Configuration
+# ---------------------------------------------------------------------------
 
-fastf1.Cache.enable_cache("cache")
+DEFAULT_YEAR = 2026
+# Set these to an integer (e.g. 1) to filter, or None to process all
+TARGET_TEST_NUMBER = 1      # e.g. 1 for "Test 1"
+TARGET_SESSION_NUMBER = 1   # e.g. 1 for "Practice 1"
 
-DEFAULT_YEAR = 2025
+# Deprecated but kept for compatibility if needed (though now unused by logic)
+SESSION_NUMBER = 1
 PROTO = "https"
 HOST = "api.multiviewer.app"
 HEADERS = {"User-Agent": "FastF1/"}
-
-SESSION_CACHE: Dict[str, fastf1.core.Session] = {}
-CIRCUIT_INFO_CACHE: Dict[str, dict] = {}
-
 ORJSON_OPTS = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
 EPS = np.finfo(float).eps
 
-# Pre-allocated smoothing kernels — avoids per-call np.ones allocation
+# Pre-allocated smoothing kernels
 _KERNEL_3 = np.ones(3, dtype=np.float64) / 3.0
 _KERNEL_9 = np.ones(9, dtype=np.float64) / 9.0
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("preseason_extraction.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("preseason_extractor")
+logging.getLogger("fastf1").setLevel(logging.WARNING)
+logging.getLogger("fastf1").propagate = False
 
+
+# ---------------------------------------------------------------------------
+# Helper Functions (Copied from main_optimized.py for standalone execution)
+# ---------------------------------------------------------------------------
 def _write_json(path: str, obj) -> None:
     with open(path, "wb") as f:
         f.write(orjson.dumps(obj, option=ORJSON_OPTS))
@@ -66,12 +90,9 @@ def _write_json(path: str, obj) -> None:
 def _td_col_to_seconds(series: pd.Series) -> list:
     if series.empty:
         return []
-    # Use view for faster NA detection and avoid intermediate arrays
-    mask = series.isna().to_numpy()
     seconds = series.dt.total_seconds().to_numpy()
-    # In-place rounding and conversion to object
-    out = np.empty(len(seconds), dtype=object)
-    out[~mask] = np.round(seconds[~mask], 3)
+    mask = series.isna().to_numpy()
+    out = np.round(seconds, 3).astype(object)
     out[mask] = "None"
     return out.tolist()
 
@@ -82,11 +103,8 @@ def _col_to_list_str_or_none(series: pd.Series) -> list:
     vals = series.to_numpy()
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
-    if mask.any():
-        out[mask] = "None"
-        out[~mask] = vals[~mask].astype(str)
-    else:
-        out = vals.astype(str)
+    out[mask] = "None"
+    out[~mask] = vals[~mask].astype(str)
     return out.tolist()
 
 
@@ -96,11 +114,8 @@ def _col_to_list_int_or_none(series: pd.Series) -> list:
     vals = series.to_numpy()
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
-    if mask.any():
-        out[mask] = "None"
-        out[~mask] = vals[~mask].astype(int)
-    else:
-        out = vals.astype(int)
+    out[mask] = "None"
+    out[~mask] = vals[~mask].astype(int)
     return out.tolist()
 
 
@@ -110,15 +125,12 @@ def _col_to_list_bool_or_none(series: pd.Series) -> list:
     vals = series.to_numpy()
     mask = pd.isna(vals)
     out = np.empty(vals.shape, dtype=object)
-    if mask.any():
-        out[mask] = "None"
-        out[~mask] = vals[~mask].astype(bool)
-    else:
-        out = vals.astype(bool)
+    out[mask] = "None"
+    out[~mask] = vals[~mask].astype(bool)
     return out.tolist()
 
+
 def _array_to_list_float_or_none(arr: np.ndarray) -> list:
-    """Convert numpy array to list, replacing NaN/inf with 'None'."""
     if arr.size == 0:
         return []
     mask = ~np.isfinite(arr)
@@ -131,7 +143,6 @@ def _array_to_list_float_or_none(arr: np.ndarray) -> list:
 
 
 def _array_to_list_int_or_none(arr: np.ndarray) -> list:
-    """Convert numpy array to list, replacing NaN/inf with 'None'."""
     if arr.size == 0:
         return []
     mask = ~np.isfinite(arr)
@@ -144,7 +155,6 @@ def _array_to_list_int_or_none(arr: np.ndarray) -> list:
 
 
 def _smooth_outliers(arr: np.ndarray, threshold: float, use_abs: bool) -> None:
-    """In-place outlier replacement: arr[i] = arr[i-1] where exceeds threshold."""
     if use_abs:
         mask = np.abs(arr) > threshold
     else:
@@ -164,19 +174,17 @@ def _compute_accelerations(
     z: np.ndarray,
     dist: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    # Convert speed km/h -> m/s as float64, avoid copies when possible
+    # Convert speed km/h -> m/s as float64
     vx = speed * (1.0 / 3.6)
     if vx.dtype != np.float64:
-        vx = vx.astype(np.float64, copy=False)
+        vx = vx.astype(np.float64)
+    time_f = (time_arr / np.timedelta64(1, "s")).astype(np.float64)
 
-    # Faster timedelta64 to float64 conversion using view
-    time_f = time_arr.view("timedelta64[ns]").astype(np.float64) / 1e9
-
-    # Ensure float64 without unnecessary copies
-    x_f = x if x.dtype == np.float64 else x.astype(np.float64, copy=False)
-    y_f = y if y.dtype == np.float64 else y.astype(np.float64, copy=False)
-    z_f = z if z.dtype == np.float64 else z.astype(np.float64, copy=False)
-    dist_f = dist if dist.dtype == np.float64 else dist.astype(np.float64, copy=False)
+    # Ensure float64 only when needed
+    x_f = x if x.dtype == np.float64 else x.astype(np.float64)
+    y_f = y if y.dtype == np.float64 else y.astype(np.float64)
+    z_f = z if z.dtype == np.float64 else z.astype(np.float64)
+    dist_f = dist if dist.dtype == np.float64 else dist.astype(np.float64)
 
     # --- X acceleration ---
     dtime = np.gradient(time_f)
@@ -187,12 +195,10 @@ def _compute_accelerations(
     # --- Shared gradient for Y and Z ---
     dx = np.gradient(x_f)
     ds = np.gradient(dist_f)
-    # Pre-compute epsilon addition once
-    dx_eps = dx + EPS
 
     # --- Y acceleration ---
     dy = np.gradient(y_f)
-    theta = np.arctan2(dy, dx_eps)
+    theta = np.arctan2(dy, dx + EPS)
     theta[0] = theta[1]
     dtheta = np.gradient(np.unwrap(theta))
     _smooth_outliers(dtheta, 0.5, use_abs=True)
@@ -203,7 +209,7 @@ def _compute_accelerations(
 
     # --- Z acceleration ---
     dz = np.gradient(z_f)
-    z_theta = np.arctan2(dz, dx_eps)
+    z_theta = np.arctan2(dz, dx + EPS)
     z_theta[0] = z_theta[1]
     z_dtheta = np.gradient(np.unwrap(z_theta))
     _smooth_outliers(z_dtheta, 0.5, use_abs=True)
@@ -228,6 +234,16 @@ def _process_telemetry_to_dict(telemetry: pd.DataFrame, data_key: str) -> dict:
     drs_raw = telemetry["DRS"].to_numpy()
     drs = ((drs_raw == 10) | (drs_raw == 12) | (drs_raw == 14)).astype(np.int8)
     brake = telemetry["Brake"].to_numpy().astype(bool).astype(np.int8)
+    driver_ahead = (
+        telemetry["DriverAhead"]
+        if "DriverAhead" in telemetry.columns
+        else pd.Series(np.nan, index=telemetry.index)
+    )
+    distance_to_driver_ahead = (
+        telemetry["DistanceToDriverAhead"].to_numpy()
+        if "DistanceToDriverAhead" in telemetry.columns
+        else np.full(len(telemetry), np.nan, dtype=np.float64)
+    )
 
     return {
         "tel": {
@@ -239,7 +255,13 @@ def _process_telemetry_to_dict(telemetry: pd.DataFrame, data_key: str) -> dict:
             "brake": _array_to_list_int_or_none(brake),
             "drs": _array_to_list_int_or_none(drs),
             "distance": _array_to_list_float_or_none(dist),
-            "rel_distance": _array_to_list_float_or_none(telemetry["RelativeDistance"].to_numpy()),
+            "rel_distance": _array_to_list_float_or_none(
+                telemetry["RelativeDistance"].to_numpy()
+            ),
+            "DriverAhead": _col_to_list_str_or_none(driver_ahead),
+            "DistanceToDriverAhead": _array_to_list_float_or_none(
+                distance_to_driver_ahead
+            ),
             "acc_x": _array_to_list_float_or_none(ax),
             "acc_y": _array_to_list_float_or_none(ay),
             "acc_z": _array_to_list_float_or_none(az),
@@ -251,53 +273,111 @@ def _process_telemetry_to_dict(telemetry: pd.DataFrame, data_key: str) -> dict:
     }
 
 
-class TelemetryExtractor:
-    def __init__(
-        self,
-        year: int = DEFAULT_YEAR,
-        events: List[str] = None,
-        sessions: List[str] = None,
-        use_joblib: bool = True,
-        n_jobs: int = -1,
-        batch_size: int = 8,
-    ):
+def check_memory_usage(threshold_percent=80, session_cache=None, circuit_cache=None):
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+
+    logger.info(
+        f"Current memory usage: {memory_percent:.2f}% "
+        f"({memory_info.rss / 1024 / 1024:.2f} MB)"
+    )
+
+    if memory_percent > threshold_percent:
+        logger.warning(
+            f"Memory usage exceeds {threshold_percent}% threshold, clearing caches"
+        )
+        if session_cache is not None:
+            session_cache.clear()
+        if circuit_cache is not None:
+            circuit_cache.clear()
+        gc.collect()
+
+        new_pct = psutil.Process(os.getpid()).memory_percent()
+        logger.info(f"New memory usage after clearing caches: {new_pct:.2f}%")
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Pre-Season Extractor
+# ---------------------------------------------------------------------------
+class PreSeasonExtractor:
+    """Extract telemetry from pre-season testing sessions."""
+
+    def __init__(self, year: int = DEFAULT_YEAR):
         self.year = year
-        self.use_joblib = use_joblib
-        self.n_jobs = n_jobs
-        self.batch_size = batch_size
-        self.events = events or ["Abu Dhabi Grand Prix"]
-        self.sessions = sessions or ["Race"]
+        self._session_cache: Dict[str, fastf1.core.Session] = {}
+        self._circuit_cache: Dict[str, dict] = {}
+
+    def discover_testing_events(self) -> List[dict]:
+        """Return list of testing events with their test_number and session count.
+        Forces backend='fastf1' to avoid 'Day 1' session naming issues.
+        """
+        try:
+            schedule = fastf1.get_event_schedule(
+                self.year, include_testing=True, backend="fastf1"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to load schedule with backend='fastf1': {e}. "
+                "Retrying with default backend..."
+            )
+            schedule = fastf1.get_event_schedule(self.year, include_testing=True)
+
+        testing = schedule[schedule["EventFormat"] == "testing"]
+
+        events = []
+        for idx, (_, row) in enumerate(testing.iterrows(), start=1):
+            n_sessions = 0
+            for s in range(1, 6):
+                col = f"Session{s}"
+                if col in row.index:
+                    val = row[col]
+                    if pd.notna(val) and str(val).strip() not in ("", "None"):
+                        n_sessions += 1
+            events.append({
+                "test_number": idx,
+                "event_name": row.get("EventName", f"Test {idx}"),
+                "sessions": max(n_sessions, 1),
+            })
+
+        logger.info(f"Discovered {len(events)} testing event(s) for {self.year}")
+        for e in events:
+            logger.info(
+                f"  Test {e['test_number']}: {e['event_name']} "
+                f"({e['sessions']} sessions)"
+            )
+        return events
 
     def get_session(
-        self, event: Union[str, int], session: str, load_telemetry: bool = False
+        self, test_number: int, session_number: int, load_telemetry: bool = False
     ) -> fastf1.core.Session:
-        cache_key = f"{self.year}-{event}-{session}"
-        cached = SESSION_CACHE.get(cache_key)
+        cache_key = f"{self.year}-T{test_number}-S{session_number}"
+        cached = self._session_cache.get(cache_key)
+
         if cached is not None:
             if load_telemetry and not getattr(cached, "_telemetry_loaded", False):
                 cached.load(telemetry=True, weather=True, messages=True)
                 cached._telemetry_loaded = True
-                SESSION_CACHE[cache_key] = cached
+                self._session_cache[cache_key] = cached
             return cached
-        f1session = fastf1.get_session(self.year, event, session)
+
+        # Enforce 'fastf1' backend to ensure correct session naming ("Practice N")
+        f1session = fastf1.get_testing_session(
+            self.year, test_number, session_number, backend="fastf1"
+        )
         f1session.load(telemetry=load_telemetry, weather=True, messages=True)
         f1session._telemetry_loaded = load_telemetry
-        SESSION_CACHE[cache_key] = f1session
+        self._session_cache[cache_key] = f1session
         return f1session
 
-    def session_drivers_list(self, event: Union[str, int], session: str) -> List[str]:
-        try:
-            f1session = self.get_session(event, session)
-            return list(f1session.laps["Driver"].unique())
-        except Exception as e:
-            logger.error(f"Error getting driver list for {event} {session}: {e}")
-            return []
-
     def session_drivers(
-        self, event: Union[str, int], session: str
+        self, test_number: int, session_number: int
     ) -> Dict[str, List[Dict[str, str]]]:
         try:
-            f1session = self.get_session(event, session)
+            f1session = self.get_session(test_number, session_number)
             laps = f1session.laps
             driver_team = laps.drop_duplicates(subset="Driver")[["Driver", "Team"]]
             drivers = [
@@ -306,16 +386,19 @@ class TelemetryExtractor:
             ]
             return {"drivers": drivers}
         except Exception as e:
-            logger.error(f"Error getting drivers for {event} {session}: {e}")
+            logger.error(
+                f"Error getting drivers for Test {test_number} Session {session_number}: {e}"
+            )
             return {"drivers": []}
 
     def laps_data(
-        self, event: Union[str, int], session: str, driver: str, f1session=None, driver_laps=None
+        self,
+        driver: str,
+        f1session: fastf1.core.Session,
+        driver_laps: pd.DataFrame = None,
     ) -> Dict[str, list]:
         try:
             if driver_laps is None:
-                if f1session is None:
-                    f1session = self.get_session(event, session)
                 driver_laps = f1session.laps.pick_drivers(driver)
 
             return {
@@ -332,16 +415,24 @@ class TelemetryExtractor:
                 "pb": _col_to_list_bool_or_none(driver_laps["IsPersonalBest"]),
             }
         except Exception as e:
-            logger.error(f"Error getting lap data for {driver} in {event} {session}: {e}")
-            return {k: [] for k in ("time", "lap", "compound", "stint", "s1", "s2", "s3", "life", "pos", "status", "pb")}
+            logger.error(f"Error getting lap data for {driver}: {e}")
+            return {
+                k: []
+                for k in (
+                    "time", "lap", "compound", "stint",
+                    "s1", "s2", "s3", "life", "pos", "status", "pb",
+                )
+            }
 
-    def get_circuit_info(self, event: str, session: str) -> Optional[Dict]:
-        cache_key = f"{self.year}-{event}-{session}"
-        if cache_key in CIRCUIT_INFO_CACHE:
-            return CIRCUIT_INFO_CACHE[cache_key]
+    def get_circuit_info(
+        self, test_number: int, session_number: int
+    ) -> Optional[Dict]:
+        cache_key = f"{self.year}-T{test_number}-S{session_number}"
+        if cache_key in self._circuit_cache:
+            return self._circuit_cache[cache_key]
 
         try:
-            f1session = self.get_session(event, session)
+            f1session = self.get_session(test_number, session_number)
             circuit_key = f1session.session_info["Meeting"]["Circuit"]["Key"]
 
             try:
@@ -355,7 +446,7 @@ class TelemetryExtractor:
                     "Distance": corners["Distance"].tolist(),
                     "Rotation": circuit_info.rotation,
                 }
-                CIRCUIT_INFO_CACHE[cache_key] = result
+                self._circuit_cache[cache_key] = result
                 return result
             except (AttributeError, KeyError):
                 circuit_df, rotation = self._get_circuit_info_from_api(circuit_key)
@@ -368,13 +459,17 @@ class TelemetryExtractor:
                         "Distance": (circuit_df["Distance"] / 10).tolist(),
                         "Rotation": rotation,
                     }
-                    CIRCUIT_INFO_CACHE[cache_key] = result
+                    self._circuit_cache[cache_key] = result
                     return result
 
-            logger.warning(f"Could not get corner data for {event} {session}")
+            logger.warning(
+                f"Could not get corner data for Test {test_number} Session {session_number}"
+            )
             return None
         except Exception as e:
-            logger.error(f"Error getting circuit info for {event} {session}: {e}")
+            logger.error(
+                f"Error getting circuit info for Test {test_number} Session {session_number}: {e}"
+            )
             return None
 
     def _get_circuit_info_from_api(
@@ -403,7 +498,9 @@ class TelemetryExtractor:
             ]
 
             return (
-                pd.DataFrame(rows, columns=["X", "Y", "Number", "Letter", "Angle", "Distance"]),
+                pd.DataFrame(
+                    rows, columns=["X", "Y", "Number", "Letter", "Angle", "Distance"]
+                ),
                 rotation,
             )
         except Exception as e:
@@ -416,18 +513,23 @@ class TelemetryExtractor:
         lap_number: int,
         driver_dir: str,
         driver_laps: pd.DataFrame,
-        event: str,
-        session: str,
+        test_number: int,
+        session_number: int,
     ) -> bool:
         file_path = f"{driver_dir}/{lap_number}_tel.json"
         try:
             selected = driver_laps[driver_laps.LapNumber == lap_number]
             if selected.empty:
-                logger.warning(f"No data for {driver} lap {lap_number} in {event} {session}")
+                logger.warning(
+                    f"No data for {driver} lap {lap_number} "
+                    f"in Test {test_number} Session {session_number}"
+                )
                 return False
 
             telemetry = selected.get_telemetry()
-            data_key = f"{self.year}-{event}-{session}-{driver}-{lap_number}"
+            data_key = (
+                f"{self.year}-PreSeasonTesting-Practice {session_number}-{driver}-{lap_number}"
+            )
             tel_data = _process_telemetry_to_dict(telemetry, data_key)
             _write_json(file_path, tel_data)
             return True
@@ -436,163 +538,231 @@ class TelemetryExtractor:
             return False
 
     def process_driver(
-        self, event: str, session: str, driver: str, base_dir: str, f1session=None
+        self,
+        test_number: int,
+        session_number: int,
+        driver: str,
+        base_dir: str,
+        f1session: fastf1.core.Session = None,
     ) -> None:
         driver_dir = f"{base_dir}/{driver}"
         os.makedirs(driver_dir, exist_ok=True)
 
         try:
             if f1session is None:
-                f1session = self.get_session(event, session, load_telemetry=True)
+                f1session = self.get_session(
+                    test_number, session_number, load_telemetry=True
+                )
 
             driver_laps = f1session.laps.pick_drivers(driver)
-            driver_laps = driver_laps.assign(LapNumber=driver_laps["LapNumber"].astype(int))
+            driver_laps = driver_laps.assign(
+                LapNumber=driver_laps["LapNumber"].astype(int)
+            )
 
-            laptimes = self.laps_data(event, session, driver, f1session, driver_laps)
+            laptimes = self.laps_data(driver, f1session, driver_laps)
             _write_json(f"{driver_dir}/laptimes.json", laptimes)
 
             lap_numbers = driver_laps["LapNumber"].tolist()
 
-            # Pre-collect existing files to avoid per-lap os.path.exists syscalls
-            existing = set(os.listdir(driver_dir)) if os.path.isdir(driver_dir) else set()
+            existing = (
+                set(os.listdir(driver_dir))
+                if os.path.isdir(driver_dir)
+                else set()
+            )
 
             for lap_number in lap_numbers:
                 fname = f"{lap_number}_tel.json"
                 if fname in existing:
                     continue
                 self._process_single_lap(
-                    driver, lap_number, driver_dir, driver_laps, event, session
+                    driver, lap_number, driver_dir, driver_laps,
+                    test_number, session_number,
                 )
 
         except Exception as e:
             logger.error(f"Error processing driver {driver}: {e}")
 
-    def process_event_session(self, event: str, session: str) -> None:
-        logger.info(f"Processing {event} - {session}")
+    def process_testing_session(
+        self, test_number: int, session_number: int
+    ) -> None:
+        label = f"Test {test_number} - Practice {session_number}"
+        logger.info(f"Processing {label}")
 
-        base_dir = f"{event}/{session}"
+        # specific requirement: /Pre-Season Testing/Practice {N}
+        # User requested to remove year from the start of base_dir
+        base_dir = (
+            f"Pre-Season Testing/Practice {session_number}"
+        )
         os.makedirs(base_dir, exist_ok=True)
 
         try:
-            f1session = self.get_session(event, session, load_telemetry=True)
+            f1session = self.get_session(
+                test_number, session_number, load_telemetry=True
+            )
 
-            drivers_info = self.session_drivers(event, session)
+            drivers_info = self.session_drivers(test_number, session_number)
             _write_json(f"{base_dir}/drivers.json", drivers_info)
 
-            corner_info = self.get_circuit_info(event, session)
+            corner_info = self.get_circuit_info(test_number, session_number)
             if corner_info:
                 _write_json(f"{base_dir}/corners.json", corner_info)
 
             drivers = [d["driver"] for d in drivers_info.get("drivers", [])]
 
             if not drivers:
+                logger.warning(f"No drivers found for {label}")
                 return
 
-            # Process drivers sequentially — avoids ThreadPoolExecutor overhead
-            # and GIL contention. The real bottleneck is telemetry computation
-            # which is numpy-bound (releases GIL), not thread scheduling.
-            for driver in drivers:
-                self.process_driver(event, session, driver, base_dir, f1session)
+            # Process drivers sequentially for stability and lowest memory overhead
+            # (Benchmarks showed sequential is faster than parallel for single-session extraction)
+            total_drivers = len(drivers)
+            for i, driver in enumerate(drivers, 1):
+                logger.info(f"Processing driver {driver} ({i}/{total_drivers})")
+                self.process_driver(
+                    test_number, session_number, driver, base_dir, f1session
+                )
+
 
         except Exception as e:
-            logger.error(f"Error processing {event} - {session}: {e}")
+            logger.error(f"Error processing {label}: {e}")
 
-    def process_all_data(self, max_workers: int = 4) -> None:
-        logger.info(f"Starting optimized telemetry extraction for {self.year} season")
-        logger.info(f"Events: {self.events}")
-        logger.info(f"Sessions: {self.sessions}")
-
+    def process_all(self) -> None:
+        logger.info(f"Starting pre-season testing extraction for {self.year}")
         start_time = time.time()
 
-        for event in self.events:
-            for session in self.sessions:
-                self.process_event_session(event, session)
+        events = self.discover_testing_events()
+        if not events:
+            logger.warning("No testing events found — nothing to extract.")
+            return
+
+        for evt in events:
+            test_num = evt["test_number"]
+            test_num = evt["test_number"]
+
+            if TARGET_TEST_NUMBER is not None and test_num != TARGET_TEST_NUMBER:
+                continue
+
+            n_sessions = evt["sessions"]
+
+            logger.info(
+                f"Processing Test {test_num}: {evt['event_name']} "
+                f"({n_sessions} sessions)"
+            )
+
+            for session_num in range(1, n_sessions + 1):
+                if TARGET_SESSION_NUMBER is not None and session_num != TARGET_SESSION_NUMBER:
+                    continue
+
+                try:
+                    self.process_testing_session(test_num, session_num)
+                except Exception as e:
+                    logger.error(
+                        f"Failed Test {test_num} Session {session_num}: {e}"
+                    )
+                check_memory_usage(
+                    session_cache=self._session_cache,
+                    circuit_cache=self._circuit_cache,
+                )
 
         elapsed = time.time() - start_time
-        logger.info(f"Telemetry extraction completed in {elapsed:.2f} seconds")
-
-    def clear_joblib_cache(self):
-        logger.info("No joblib cache to clear (optimized version)")
-
-
-def check_memory_usage(threshold_percent=80):
-    process = psutil.Process(os.getpid())
-    memory_info = process.memory_info()
-    memory_percent = process.memory_percent()
-
-    logger.info(
-        f"Current memory usage: {memory_percent:.2f}% ({memory_info.rss / 1024 / 1024:.2f} MB)"
-    )
-
-    if memory_percent > threshold_percent:
-        logger.warning(f"Memory usage exceeds {threshold_percent}% threshold, clearing caches")
-        SESSION_CACHE.clear()
-        CIRCUIT_INFO_CACHE.clear()
-        gc.collect()
-
-        new_pct = psutil.Process(os.getpid()).memory_percent()
-        logger.info(f"New memory usage after clearing caches: {new_pct:.2f}%")
-        return True
-
-    return False
+        logger.info(
+            f"Pre-season testing extraction completed in {elapsed:.2f} seconds"
+        )
 
 
-def is_data_available(year, events, sessions):
+# ======================================================================
+# Data Availability
+# ======================================================================
+def is_testing_data_available(year: int) -> bool:
+    """Check if any pre-season testing data is available by scanning all sessions."""
     try:
-        if not events or not sessions:
-            logger.warning("No events or sessions specified to check")
+        # Enforce 'fastf1' backend to strictly avoid 'Day 1' session issues
+        # and get the full schedule to know what to check
+        schedule = fastf1.get_event_schedule(year, include_testing=True, backend="fastf1")
+        testing = schedule[schedule["EventFormat"] == "testing"]
+
+        if testing.empty:
+            logger.info(f"No testing events found in {year} schedule yet.")
             return False
 
-        event, session = events[0], sessions[0]
-        logger.info(f"Checking data availability for {year} {event} {session}...")
+        # Iterate through all testing events and their sessions
+        for idx, (_, row) in enumerate(testing.iterrows(), start=1):
+            if TARGET_TEST_NUMBER is not None and idx != TARGET_TEST_NUMBER:
+                continue
 
-        f1session = fastf1.get_session(year, event, session)
-        f1session.load(telemetry=False, weather=False, messages=False)
+            # Check up to 5 sessions per event
+            for s_num in range(1, 6):
+                if TARGET_SESSION_NUMBER is not None and s_num != TARGET_SESSION_NUMBER:
+                    continue
 
-        if f1session.laps.empty:
-            logger.info(f"No lap data available yet for {year} {event} {session}")
-            return False
-        if len(f1session.laps["Driver"].unique()) == 0:
-            logger.info(f"No driver data available yet for {year} {event} {session}")
-            return False
+                col = f"Session{s_num}"
+                if col not in row.index:
+                    continue
 
-        logger.info(f"Data is available for {year} {event} {session}")
-        return True
+                # Check if session exists in schedule
+                val = row[col]
+                if pd.isna(val) or str(val).strip() in ("", "None"):
+                    continue
+
+                try:
+                    # Attempt to load this specific session
+                    f1session = fastf1.get_testing_session(
+                        year, idx, s_num, backend="fastf1"
+                    )
+                    # Minimal load to check for data
+                    f1session.load(telemetry=False, weather=False, messages=False)
+
+                    if not f1session.laps.empty and len(f1session.laps["Driver"].unique()) > 0:
+                        logger.info(
+                            f"Data detected for Test {idx} Session {s_num}. "
+                            "Extraction checks passed."
+                        )
+                        return True
+                except Exception:
+                    # If a specific session fails, continue checking others
+                    continue
+
+        logger.info(f"No data available yet for any {year} pre-season testing session")
+        return False
     except Exception as e:
-        logger.info(f"Data not yet available: {e}")
+        logger.warning(f"Testing data check failed: {e}")
         return False
 
 
 def main():
     try:
-        extractor = TelemetryExtractor()
+        year = DEFAULT_YEAR
 
-        is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
-        max_workers = 12 if is_github_actions else 8
+        # Use separate cache to avoid pollution from main scripts
+        os.makedirs("cache_preseason", exist_ok=True)
+        fastf1.Cache.enable_cache("cache_preseason")
 
-        wait_time = 30
+        extractor = PreSeasonExtractor(year=year)
         max_attempts = 720
+        wait_time = 30
         attempt = 0
 
-        logger.info(f"Starting to wait for {extractor.year} season data...")
+        logger.info(f"Starting to wait for {year} pre-season testing data...")
 
         while attempt < max_attempts:
-            if is_data_available(extractor.year, extractor.events, extractor.sessions):
-                logger.info(f"Data is available for {extractor.year} season. Starting extraction...")
-                extractor.process_all_data(max_workers=max_workers)
+            if is_testing_data_available(year):
+                logger.info(
+                    f"Data is available for {year} pre-season testing. "
+                    "Starting extraction..."
+                )
+                extractor.process_all()
                 break
             else:
                 attempt += 1
                 logger.info(
-                    f"Data not yet available. Waiting {wait_time}s before retry ({attempt}/{max_attempts})..."
+                    f"Data not yet available. Waiting {wait_time}s "
+                    f"before retry ({attempt}/{max_attempts})..."
                 )
                 time.sleep(wait_time)
-                check_memory_usage()
+                gc.collect()
 
         if attempt >= max_attempts:
-            logger.error(
-                f"Exceeded maximum wait time ({max_attempts * wait_time / 3600} hours). Exiting."
-            )
+            logger.error("Exceeded maximum wait time. Exiting.")
 
     except Exception as e:
         logger.error(f"Error in main function: {e}")
